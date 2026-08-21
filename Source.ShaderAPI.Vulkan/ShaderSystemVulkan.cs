@@ -275,20 +275,66 @@ public class ShaderSystemVulkan(IServiceProvider services, IFileSystem fileSyste
 		textureVar.SetTextureValue(texture);
 	}
 
+	readonly Dictionary<ulong, VertexShaderHandle> vshs = [];
+	readonly Dictionary<ulong, PixelShaderHandle> pshs = [];
 	readonly HashSet<ulong> warnedShaders = [];
-	void WarnOnce(ReadOnlySpan<char> name, string type) {
-		ulong hash = name.Hash();
-		if (warnedShaders.Add(hash))
-			DevMsg($"Vulkan: {type} shader '{name}' requested; SPIR-V loading not implemented yet\n");
+
+	static ulong ComboSymbol(ReadOnlySpan<char> name, ReadOnlySpan<char> defines) {
+		ulong symbol = name.Hash();
+		if (!defines.IsEmpty)
+			symbol ^= defines.Hash();
+		return symbol;
+	}
+
+	void WarnOnce(ReadOnlySpan<char> name, string message) {
+		if (warnedShaders.Add(name.Hash()))
+			Warning($"Vulkan: {message}\n");
+	}
+
+	/// <summary>Reads shaders/{name} (a .spv produced by the Game.Assets build) and wraps it in a VkShaderModule.</summary>
+	nint LoadShaderModule(ReadOnlySpan<char> name, string typeName) {
+		using IFileHandle? handle = fileSystem.Open($"shaders/{name}", FileOpenOptions.Read, "game");
+		if (handle == null) {
+			WarnOnce(name, $"{typeName} shader 'shaders/{name}' not found (is the Vulkan SDK installed so the build can produce SPIR-V?)");
+			return 0;
+		}
+
+		byte[] spirv = new byte[handle.Stream.Length];
+		handle.Stream.ReadExactly(spirv);
+
+		nint module = ((ShaderAPIVulkan)ShaderAPI).CreateShaderModule(spirv);
+		if (module == 0)
+			WarnOnce(name, $"{typeName} shader module creation failed for '{name}'");
+		else
+			Msg($"Loaded SPIR-V shader: {name} ({typeName})\n");
+		return module;
 	}
 
 	public VertexShaderHandle LoadVertexShader(ReadOnlySpan<char> name, ReadOnlySpan<char> defines = default) {
-		WarnOnce(name, "vertex");
-		return VertexShaderHandle.INVALID;
+		ulong symbol = ComboSymbol(name, defines);
+		if (vshs.TryGetValue(symbol, out VertexShaderHandle cached))
+			return cached;
+
+		nint module = LoadShaderModule(name, "Vertex");
+		if (module == 0)
+			return VertexShaderHandle.INVALID; // not cached so a later device/file appearance can retry
+
+		VertexShaderHandle vsh = new(module);
+		vshs[symbol] = vsh;
+		return vsh;
 	}
 
 	public PixelShaderHandle LoadPixelShader(ReadOnlySpan<char> name, ReadOnlySpan<char> defines = default) {
-		WarnOnce(name, "pixel");
-		return PixelShaderHandle.INVALID;
+		ulong symbol = ComboSymbol(name, defines);
+		if (pshs.TryGetValue(symbol, out PixelShaderHandle cached))
+			return cached;
+
+		nint module = LoadShaderModule(name, "Pixel");
+		if (module == 0)
+			return PixelShaderHandle.INVALID;
+
+		PixelShaderHandle psh = new(module);
+		pshs[symbol] = psh;
+		return psh;
 	}
 }

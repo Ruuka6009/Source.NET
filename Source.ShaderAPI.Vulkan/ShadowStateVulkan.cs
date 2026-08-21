@@ -17,6 +17,10 @@ public class ShadowStateVulkan(ShaderAPIVulkan shaderAPI, ReadOnlySpan<char> nam
 	internal bool Blending;
 	internal bool AlphaTesting;
 
+	// Future pipeline key pieces (Phase 3)
+	internal VertexShaderHandle VertexShader = VertexShaderHandle.INVALID;
+	internal PixelShaderHandle PixelShader = PixelShaderHandle.INVALID;
+
 	public void DepthFunc(ShaderDepthFunc depthFunc) { }
 	public void EnableDepthWrites(bool enable) { }
 	public void EnableDepthTest(bool enable) { }
@@ -32,8 +36,12 @@ public class ShadowStateVulkan(ShaderAPIVulkan shaderAPI, ReadOnlySpan<char> nam
 	public void EnableConstantColor(bool enable) { }
 	public void VertexShaderVertexFormat(VertexFormat format, int texCoordCount, Span<int> texCoordDimensions, int userDataSize)
 		=> vertexFormat = format;
-	public void SetVertexShader(ReadOnlySpan<char> fileName, int staticIndex = 0) { }
-	public void SetPixelShader(ReadOnlySpan<char> fileName, int staticIndex = 0) { }
+	public void SetVertexShader(ReadOnlySpan<char> fileName, int staticIndex = 0) {
+		VertexShader = shaderAPI.ShaderLoader.LoadVertexShader($"{fileName}_{GetDriver().Extension(ShaderType.Vertex)}");
+	}
+	public void SetPixelShader(ReadOnlySpan<char> fileName, int staticIndex = 0) {
+		PixelShader = shaderAPI.ShaderLoader.LoadPixelShader($"{fileName}_{GetDriver().Extension(ShaderType.Pixel)}");
+	}
 	public int GetStaticComboScale(ShaderType type, ReadOnlySpan<char> fileName, ReadOnlySpan<char> name) => 1;
 	public void EnableVertexBlend(bool enable) { }
 	public void OverbrightValue(TextureStage stage, float value) { }

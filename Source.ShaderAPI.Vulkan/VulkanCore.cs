@@ -269,7 +269,9 @@ public unsafe class VulkanCore : IDisposable
 		PhysicalDeviceVulkan13Features features13 = new() { SType = StructureType.PhysicalDeviceVulkan13Features };
 		PhysicalDeviceFeatures2 features2 = new() { SType = StructureType.PhysicalDeviceFeatures2, PNext = &features13 };
 		Vk.GetPhysicalDeviceFeatures2(device, &features2);
-		return features13.DynamicRendering && features13.Synchronization2;
+		// ShaderDemoteToHelperInvocation: glslc compiles GLSL 'discard' to OpDemoteToHelperInvocation
+		// when targeting vulkan1.3, so it is effectively mandatory for our shaders.
+		return features13.DynamicRendering && features13.Synchronization2 && features13.ShaderDemoteToHelperInvocation;
 	}
 
 	bool CreateLogicalDevice() {
@@ -291,7 +293,8 @@ public unsafe class VulkanCore : IDisposable
 		PhysicalDeviceVulkan13Features features13 = new() {
 			SType = StructureType.PhysicalDeviceVulkan13Features,
 			DynamicRendering = true,
-			Synchronization2 = true
+			Synchronization2 = true,
+			ShaderDemoteToHelperInvocation = true
 		};
 		PhysicalDeviceFeatures2 features2 = new() {
 			SType = StructureType.PhysicalDeviceFeatures2,

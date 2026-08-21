@@ -16,4 +16,29 @@
     <ProjectReference Include="..\Source.GUI.Controls\Source.GUI.Controls.csproj" />
   </ItemGroup>
 
+  <!-- Compile Vulkan GLSL (*_vk13.vs/.fs) to SPIR-V next to the sources.
+       The launcher's asset-copy step then picks the .spv files up with everything else.
+       Skips with a warning when the Vulkan SDK (glslc) is not installed - only the
+       Vulkan backend needs these, GL is unaffected. -->
+  <Target Name="CompileVulkanShaders" BeforeTargets="Build">
+    <ItemGroup>
+      <VulkanVertexShader Include="hl2\shaders\*_vk13.vs" />
+      <VulkanFragmentShader Include="hl2\shaders\*_vk13.fs" />
+      <VulkanShaderInclude Include="hl2\shaders\*_vk13.glsl" />
+      <_GlslcCandidate Include="$(VULKAN_SDK)\Bin\glslc.exe" Condition="'$(VULKAN_SDK)' != ''" />
+      <_GlslcCandidate Include="C:\VulkanSDK\*\Bin\glslc.exe" Condition="'$(VULKAN_SDK)' == ''" />
+    </ItemGroup>
+    <PropertyGroup>
+      <_GlslcExe>@(_GlslcCandidate->Distinct())</_GlslcExe>
+      <!-- If several SDKs matched, keep the last (newest by version-sorted path) -->
+      <_GlslcExe Condition="$(_GlslcExe.Contains(';'))">$(_GlslcExe.Substring($([MSBuild]::Add($(_GlslcExe.LastIndexOf(';')), 1))))</_GlslcExe>
+    </PropertyGroup>
+    <Warning Condition="'$(_GlslcExe)' == '' or !Exists('$(_GlslcExe)')"
+             Text="Vulkan SDK (glslc) not found - skipping SPIR-V shader compilation. Install the LunarG Vulkan SDK to build the Vulkan backend's shaders." />
+    <Exec Condition="'$(_GlslcExe)' != '' and Exists('$(_GlslcExe)')"
+          Command="&quot;$(_GlslcExe)&quot; -fshader-stage=vertex --target-env=vulkan1.3 -I &quot;$(MSBuildThisFileDirectory)hl2\shaders&quot; -o &quot;%(VulkanVertexShader.FullPath).spv&quot; &quot;%(VulkanVertexShader.FullPath)&quot;" />
+    <Exec Condition="'$(_GlslcExe)' != '' and Exists('$(_GlslcExe)')"
+          Command="&quot;$(_GlslcExe)&quot; -fshader-stage=fragment --target-env=vulkan1.3 -I &quot;$(MSBuildThisFileDirectory)hl2\shaders&quot; -o &quot;%(VulkanFragmentShader.FullPath).spv&quot; &quot;%(VulkanFragmentShader.FullPath)&quot;" />
+  </Target>
+
 </Project>

@@ -407,3 +407,6 @@ Game.Assets/sourceengine
 Game.Assets/hl2/cfg/autoexec.cfg
 Source.Launcher/Properties/launchSettings.json
 /.idea
+
+# Generated SPIR-V (built by Game.Assets CompileVulkanShaders from the *_vk13 GLSL)
+Game.Assets/hl2/shaders/*.spv

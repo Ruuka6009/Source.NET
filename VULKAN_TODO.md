@@ -1,13 +1,14 @@
 # Vulkan backend TODO
 
-Replacing the GL 4.6 renderer. What exists today:
+Adding a Vulkan renderer **alongside** the GL 4.6 one. **GL is never deleted** — both backends stay
+switchable per launch (`-gl` default / `-vulkan`); that is a project decision, not a transition state.
 
 | Piece | Size | Fate |
 |---|---|---|
-| `Source.ShaderAPI.Gl46` | 11 files, 5227 lines | reimplement as `Source.ShaderAPI.Vulkan` |
-| `Source.StdShader.Gl46` | 14 files, 2482 lines | port shader classes |
-| `Game.Assets/hl2/shaders/*_gl460.{vs,fs,glsl}` | 17 files | recompile to SPIR-V |
-| `Dependencies/OpenGL` | 15156 lines | keep until GL backend is dropped |
+| `Source.ShaderAPI.Gl46` | 11 files, 5227 lines | stays; sibling `Source.ShaderAPI.Vulkan` |
+| `Source.StdShader.Gl46` | 14 files, 2482 lines | shader classes shared via interfaces |
+| `Game.Assets/hl2/shaders/*_gl460.{vs,fs,glsl}` | 17 files | stay; `*_vk13` ports compiled to SPIR-V |
+| `Dependencies/OpenGL` | 15156 lines | keep permanently |
 | `Source.MaterialSystem` | 21 files, 10621 lines | **should not need changes** if the seams hold |
 
 The contract a Vulkan backend must satisfy is `Source.Common/ShaderAPI/`: `IShaderAPI` (~100 members),
@@ -19,8 +20,11 @@ The contract a Vulkan backend must satisfy is `Source.Common/ShaderAPI/`: `IShad
 
 - [x] Pick a binding. **Decision: Silk.NET.Vulkan** (actively maintained, same ecosystem as the SDL3 usage).
 - [x] Keep GL alive alongside Vulkan rather than deleting it. `GraphicsDriver` is already a flags enum, so both can coexist and be A/B'd. Deleting GL first means debugging a black screen with no reference. **Decision: GL stays; `-vulkan` opts in.**
-- [ ] Shader toolchain: GLSL -> SPIR-V via glslang/shaderc, run at build time, output next to the GLSL.
-      Note: shader sources live in `Source.StdShader.Gl46/` (copied into `Game.Assets/hl2/shaders/` at build), so the compile step belongs in the StdShader csproj.
+- [x] Shader toolchain: **glslc** (Vulkan SDK 1.4.357 installed 2026-08-21). `Game.Assets.csproj`'s
+      `CompileVulkanShaders` target compiles `hl2/shaders/*_vk13.{vs,fs}` to `.spv` next to the sources
+      at build time (warns+skips without the SDK; `.spv` is gitignored). The launcher's asset copy now
+      runs `AfterTargets=ResolveProjectReferences` so generated `.spv` get picked up.
+      (Correction to an earlier note: shader sources live in `Game.Assets/hl2/shaders/` directly.)
 
 ## Phase 1 — widen the seams (all in existing code, no Vulkan yet) — DONE
 
@@ -77,17 +81,30 @@ mismatch is the bulk of the work.
 
 ## Phase 5 — shaders
 
-- [ ] 17 GLSL files -> SPIR-V. `common_gl460.glsl` is an include, so a preprocessor pass is needed first.
-- [ ] Explicit `layout(set=, binding=)` on every resource — GL let these be implicit, Vulkan will not.
-- [ ] Port the 14 classes in `Source.StdShader.Gl46`; `BaseShader`/`BaseVSShader` hold the binding logic
-      and are where most of the porting effort sits.
+- [x] GLSL -> SPIR-V: 12 `*_vk13` sources ported (unlitgeneric, lightmappedgeneric,
+      worldvertextransition, shadow, shadowmodel, white, writez + `common_vk13.glsl`), all compile with
+      glslc and load into `VkShaderModule`s at runtime (verified: unlitgeneric loads during boot with
+      zero validation errors). Binding convention documented in `common_vk13.glsl`:
+      set 0 = UBOs (same binding numbers as GL), set 1 = material textures, push constants = `flags`.
+      glslc needs no separate preprocessor pass — its `#include` handles `common_vk13.glsl` natively.
+- [ ] **`vertexlitgeneric` is not ported** — it is the only combo-based shader (STATIC/DYNAMIC combo
+      comments used as #defines). Precompiling every combo is 1024x640 variants; rewrite it with
+      uniform/push-constant branching (interface-affecting combos like VERTEXCOLOR/CUBEMAP can be
+      always-declared and branched) or specialization constants for the scalar ones.
+- [ ] Runtime loading lives in `ShaderSystemVulkan.LoadVertexShader/LoadPixelShader` (reads the `.spv`
+      via IFileSystem, caches modules); `ShadowStateVulkan` records the handles as future pipeline key
+      pieces. Combos/defines are ignored at load — revisit with the vertexlitgeneric rework.
+- [ ] Shader classes in `Source.StdShader.Gl46` run unmodified against the Vulkan stubs (they only
+      talk to interfaces); `BaseShader`/`BaseVSShader` binding logic still needs a Vulkan-aware pass
+      once descriptor sets exist (Phase 4).
 
-## Phase 6 — cutover
+## Phase 6 — backend selection (GL is permanent, no cutover)
 
-- [ ] `Source.Launcher/Program.cs` wires `.WithComponent<IShaderAPI, ShaderAPIGl46>()` and
-      `.WithStdShader<StdShaderGl46>()` — select by cmdline (`-vulkan`) / config instead.
+- [x] `Source.Launcher/Program.cs` selects `ShaderAPIVulkan` vs `ShaderAPIGl46` on `-vulkan`
+      (matching `MaterialSystem_Config.Driver`'s cmdline switch).
 - [ ] Fall back to GL if Vulkan init fails, log loudly.
-- [ ] Only after parity: delete `Dependencies/OpenGL` and the Gl46 projects.
+- [ ] ~~Only after parity: delete `Dependencies/OpenGL` and the Gl46 projects.~~ **Decision (2026-08-21):
+      GL is never deleted. Both backends stay maintained and switchable per launch.**
 
 ## Notes
 

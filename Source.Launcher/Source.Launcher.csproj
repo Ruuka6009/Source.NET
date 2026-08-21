@@ -37,8 +37,9 @@
 		<ProjectReference Include="..\Source.VTF\Source.VTF.csproj" />
 	</ItemGroup>
 
-	<!-- Copy Game.Assets -->
-	<Target Name="PreBuild" BeforeTargets="PreBuildEvent">
+	<!-- Copy Game.Assets. Runs after project references so files generated during the
+	     Game.Assets build (compiled SPIR-V shaders) are included. -->
+	<Target Name="PreBuild" AfterTargets="ResolveProjectReferences">
 		<ItemGroup>
 			<GameAssets Include="$(MSBuildThisFileDirectory)..\Game.Assets\**\*" Exclude="$(MSBuildThisFileDirectory)..\Game.Assets\**\*.cs;$(MSBuildThisFileDirectory)..\Game.Assets\**\*.csproj;$(MSBuildThisFileDirectory)..\Game.Assets\obj\**;$(MSBuildThisFileDirectory)..\Game.Assets\bin\**" />
 		</ItemGroup>

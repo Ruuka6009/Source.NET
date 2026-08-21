@@ -54,7 +54,7 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 
 	public bool SetMode(IWindow window, in ShaderDeviceInfo info) {
 		if (IsActive())
-			ReleaseResources();
+			DestroyDevice();
 
 		if (!InitDevice(window, in info))
 			return false;
@@ -99,8 +99,8 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 
 		if (frameLoop.NeedsRecreate || (Device?.VSyncChanged ?? false)) {
 			LauncherManager.DisplayedSize(out int width, out int height);
-			if (width > 0 && height > 0)
-				swapchain.Recreate((uint)width, (uint)height, Device?.VSync ?? true);
+			if (width > 0 && height > 0 && swapchain.Recreate((uint)width, (uint)height, Device?.VSync ?? true))
+				frameLoop.CreateRenderFinishedSemaphores();
 			Device?.AcknowledgeVSyncChange();
 		}
 	}
@@ -126,7 +126,13 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		return true;
 	}
 
-	public void ReleaseResources() {
+	// Release/ReacquireResources are the engine's lightweight "free device-reset-sensitive
+	// resources" pair (GL frees dynamic buffers/render targets here) - they must NOT tear
+	// down the device. Nothing to flush in the shim yet.
+	public void ReleaseResources() { }
+	public void ReacquireResources() { }
+
+	void DestroyDevice() {
 		frameLoop?.Dispose();
 		frameLoop = null;
 		swapchain?.Dispose();
@@ -135,8 +141,6 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		core = null;
 		Device = null;
 	}
-
-	public void ReacquireResources() { }
 
 	readonly List<Action> ModeChangeCallbacks = [];
 	public void AddModeChangeCallBack(Action func) {
@@ -150,6 +154,28 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 
 	public IShaderDevice GetShaderDevice() => this;
 	public GraphicsDriver GetDriver() => Driver;
+
+	internal IShaderInit ShaderLoader => (IShaderInit)ShaderManager;
+
+	/// <summary>Wraps vkCreateShaderModule; 0 on failure or before device init.</summary>
+	internal unsafe nint CreateShaderModule(ReadOnlySpan<byte> spirv) {
+		if (core == null) {
+			Warning("Vulkan: shader module requested before device init\n");
+			return 0;
+		}
+		fixed (byte* code = spirv) {
+			Silk.NET.Vulkan.ShaderModuleCreateInfo info = new() {
+				SType = Silk.NET.Vulkan.StructureType.ShaderModuleCreateInfo,
+				CodeSize = (nuint)spirv.Length,
+				PCode = (uint*)code
+			};
+			if (core.Vk.CreateShaderModule(core.Device, &info, null, out Silk.NET.Vulkan.ShaderModule module) != Silk.NET.Vulkan.Result.Success) {
+				Warning("Vulkan: vkCreateShaderModule failed\n");
+				return 0;
+			}
+			return unchecked((nint)module.Handle);
+		}
+	}
 	public ReadOnlySpan<char> GetDriverVersionString() => core?.DeviceDescription ?? "Vulkan (no device)";
 
 	public int GetCurrentAdapter() => LauncherManager.GetCurrentDisplayIndex();

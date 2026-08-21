@@ -18,7 +18,9 @@ public unsafe class VulkanFrameLoop : IDisposable
 	CommandPool commandPool;
 	readonly CommandBuffer[] commandBuffers = new CommandBuffer[FramesInFlight];
 	readonly VkSemaphore[] imageAvailable = new VkSemaphore[FramesInFlight];
-	readonly VkSemaphore[] renderFinished = new VkSemaphore[FramesInFlight];
+	// Signaled-by-present semaphores must be per swapchain image, not per frame in flight:
+	// a present may still be reading one when the same frame index comes around again.
+	VkSemaphore[] renderFinished = [];
 	readonly Fence[] inFlight = new Fence[FramesInFlight];
 	int currentFrame;
 
@@ -60,9 +62,27 @@ public unsafe class VulkanFrameLoop : IDisposable
 		FenceCreateInfo fenceInfo = new() { SType = StructureType.FenceCreateInfo, Flags = FenceCreateFlags.SignaledBit };
 		for (int i = 0; i < FramesInFlight; i++) {
 			if (vk.CreateSemaphore(core.Device, &semaphoreInfo, null, out imageAvailable[i]) != Result.Success ||
-				vk.CreateSemaphore(core.Device, &semaphoreInfo, null, out renderFinished[i]) != Result.Success ||
 				vk.CreateFence(core.Device, &fenceInfo, null, out inFlight[i]) != Result.Success) {
 				Warning("Vulkan: sync object creation failed\n");
+				return false;
+			}
+		}
+		return CreateRenderFinishedSemaphores();
+	}
+
+	/// <summary>(Re)creates the per-swapchain-image present semaphores. Call after swapchain (re)creation.</summary>
+	public bool CreateRenderFinishedSemaphores() {
+		Vk vk = core.Vk;
+		vk.DeviceWaitIdle(core.Device);
+		foreach (VkSemaphore semaphore in renderFinished)
+			if (semaphore.Handle != 0)
+				vk.DestroySemaphore(core.Device, semaphore, null);
+
+		SemaphoreCreateInfo semaphoreInfo = new() { SType = StructureType.SemaphoreCreateInfo };
+		renderFinished = new VkSemaphore[swapchain.Images.Length];
+		for (int i = 0; i < renderFinished.Length; i++) {
+			if (vk.CreateSemaphore(core.Device, &semaphoreInfo, null, out renderFinished[i]) != Result.Success) {
+				Warning("Vulkan: present semaphore creation failed\n");
 				return false;
 			}
 		}
@@ -132,7 +152,7 @@ public unsafe class VulkanFrameLoop : IDisposable
 		};
 		SemaphoreSubmitInfo signalInfo = new() {
 			SType = StructureType.SemaphoreSubmitInfo,
-			Semaphore = renderFinished[currentFrame],
+			Semaphore = renderFinished[imageIndex],
 			StageMask = PipelineStageFlags2.AllCommandsBit
 		};
 		CommandBufferSubmitInfo cmdInfo = new() {
@@ -151,7 +171,7 @@ public unsafe class VulkanFrameLoop : IDisposable
 		vk.QueueSubmit2(core.GraphicsQueue, 1, &submitInfo, inFlight[currentFrame]);
 
 		SwapchainKHR swapchainHandle = swapchain.Swapchain;
-		VkSemaphore renderFinishedHandle = renderFinished[currentFrame];
+		VkSemaphore renderFinishedHandle = renderFinished[imageIndex];
 		PresentInfoKHR presentInfo = new() {
 			SType = StructureType.PresentInfoKhr,
 			WaitSemaphoreCount = 1,
@@ -199,9 +219,11 @@ public unsafe class VulkanFrameLoop : IDisposable
 		vk.DeviceWaitIdle(core.Device);
 		for (int i = 0; i < FramesInFlight; i++) {
 			if (imageAvailable[i].Handle != 0) vk.DestroySemaphore(core.Device, imageAvailable[i], null);
-			if (renderFinished[i].Handle != 0) vk.DestroySemaphore(core.Device, renderFinished[i], null);
 			if (inFlight[i].Handle != 0) vk.DestroyFence(core.Device, inFlight[i], null);
 		}
+		foreach (VkSemaphore semaphore in renderFinished)
+			if (semaphore.Handle != 0)
+				vk.DestroySemaphore(core.Device, semaphore, null);
 		if (commandPool.Handle != 0)
 			vk.DestroyCommandPool(core.Device, commandPool, null);
 	}

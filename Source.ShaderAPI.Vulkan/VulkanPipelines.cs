@@ -24,6 +24,8 @@ public struct VulkanPipelineKey : IEquatable<VulkanPipelineKey>
 	public MaterialPrimitiveType Topology;
 	public VkFormat ColorFormat;
 	public VkFormat DepthFormat;
+	/// <summary>Stride of the static prop lighting stream, 0 when no color mesh is bound.</summary>
+	public int ColorMeshStride;
 
 	public readonly bool Equals(VulkanPipelineKey other) {
 		ref readonly GraphicsBoardState a = ref State;
@@ -34,6 +36,7 @@ public struct VulkanPipelineKey : IEquatable<VulkanPipelineKey>
 			&& Topology == other.Topology
 			&& ColorFormat == other.ColorFormat
 			&& DepthFormat == other.DepthFormat
+			&& ColorMeshStride == other.ColorMeshStride
 			&& a.Blending == b.Blending
 			&& a.SourceBlend == b.SourceBlend
 			&& a.DestinationBlend == b.DestinationBlend
@@ -63,6 +66,7 @@ public struct VulkanPipelineKey : IEquatable<VulkanPipelineKey>
 		hash.Add(Topology);
 		hash.Add(ColorFormat);
 		hash.Add(DepthFormat);
+		hash.Add(ColorMeshStride);
 		hash.Add(State.Blending);
 		hash.Add(State.SourceBlend);
 		hash.Add(State.DestinationBlend);
@@ -674,19 +678,22 @@ public unsafe class VulkanPipelineSystem : IDisposable
 			}
 		};
 
+		bool hasColorMesh = key.ColorMeshStride > 0;
 		Span<VertexInputAttributeDescription> attributes = stackalloc VertexInputAttributeDescription[VulkanVertexLayout.LocationCount];
-		uint stride = VulkanVertexLayout.BuildAttributes(key.Format, attributes);
+		uint stride = VulkanVertexLayout.BuildAttributes(key.Format, attributes, hasColorMesh);
 
-		VertexInputBindingDescription* bindings = stackalloc VertexInputBindingDescription[2] {
+		uint bindingCount = hasColorMesh ? 3u : 2u;
+		VertexInputBindingDescription* bindings = stackalloc VertexInputBindingDescription[3] {
 			new VertexInputBindingDescription(VulkanVertexLayout.VertexDataBinding, stride, VertexInputRate.Vertex),
 			// Stride 0 = every vertex reads the same 64 zero bytes; feeds attributes the format lacks.
-			new VertexInputBindingDescription(VulkanVertexLayout.ZeroBufferBinding, 0, VertexInputRate.Vertex)
+			new VertexInputBindingDescription(VulkanVertexLayout.ZeroBufferBinding, 0, VertexInputRate.Vertex),
+			new VertexInputBindingDescription(VulkanVertexLayout.ColorMeshBinding, (uint)key.ColorMeshStride, VertexInputRate.Vertex)
 		};
 
 		fixed (VertexInputAttributeDescription* attributesPtr = attributes) {
 			PipelineVertexInputStateCreateInfo vertexInput = new() {
 				SType = StructureType.PipelineVertexInputStateCreateInfo,
-				VertexBindingDescriptionCount = 2,
+				VertexBindingDescriptionCount = bindingCount,
 				PVertexBindingDescriptions = bindings,
 				VertexAttributeDescriptionCount = VulkanVertexLayout.LocationCount,
 				PVertexAttributeDescriptions = attributesPtr

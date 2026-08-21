@@ -212,15 +212,18 @@ public unsafe class MeshVulkan : IMesh
 	}
 
 	IMesh? ColorMesh;
-	static bool warnedColorMesh;
+	int ColorMeshVertOffsetInBytes;
 
 	public virtual void SetColorMesh(IMesh colorMesh, int vertexOffset) {
 		ColorMesh = colorMesh;
-		if (colorMesh != null && !warnedColorMesh) {
-			warnedColorMesh = true;
-			Warning("Vulkan: color meshes (static prop lighting streams) are not implemented yet; ignoring\n");
-		}
+		ColorMeshVertOffsetInBytes = vertexOffset;
 	}
+
+	/// <summary>The static prop lighting stream for this draw, if one is bound.</summary>
+	internal VertexBufferVulkan? GetColorMeshBuffer() => ((MeshVulkan?)ColorMesh)?.VertexBuffer;
+
+	/// <summary>Stride of that stream, or 0 when there is none - part of the pipeline key.</summary>
+	internal int GetColorMeshStride() => GetColorMeshBuffer()?.VertexSize ?? 0;
 
 	public virtual MaterialPrimitiveType GetPrimitiveType() => Type;
 
@@ -282,7 +285,7 @@ public unsafe class MeshVulkan : IMesh
 				throw new NotImplementedException();
 
 			if (!bound) {
-				if (!ShaderAPI.BindMeshBuffers(VertexBuffer, IndexBuffer))
+				if (!ShaderAPI.BindMeshBuffers(VertexBuffer, IndexBuffer, GetColorMeshBuffer(), ColorMeshVertOffsetInBytes))
 					return;
 				bound = true;
 			}

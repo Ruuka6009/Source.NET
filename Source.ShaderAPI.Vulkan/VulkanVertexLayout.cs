@@ -31,6 +31,8 @@ public static class VulkanVertexLayout
 
 	public const uint VertexDataBinding = 0;
 	public const uint ZeroBufferBinding = 1;
+	/// <summary>Static prop lighting stream, feeding Specular when a color mesh is bound.</summary>
+	public const uint ColorMeshBinding = 2;
 
 	static Format FloatFormat(int count) => count switch {
 		1 => Format.R32Sfloat,
@@ -53,7 +55,7 @@ public static class VulkanVertexLayout
 	/// returns the vertex stride. Attributes present in the format read binding 0 at their
 	/// computed offset; absent ones read the zero buffer at binding 1.
 	/// </summary>
-	public static uint BuildAttributes(VertexFormat format, Span<VertexInputAttributeDescription> attributes) {
+	public static uint BuildAttributes(VertexFormat format, Span<VertexInputAttributeDescription> attributes, bool hasColorMesh = false) {
 		for (uint loc = 0; loc < LocationCount; loc++)
 			attributes[(int)loc] = new VertexInputAttributeDescription(loc, ZeroBufferBinding, AbsentFormat(loc), 0);
 
@@ -98,6 +100,11 @@ public static class VulkanVertexLayout
 		int userDataSize = format.GetUserDataSize();
 		if (userDataSize > 0)
 			Place(attributes, LocUserData, FloatFormat(userDataSize), (uint)(userDataSize * 4));
+
+		// A bound color mesh overrides Specular and sources it from its own stream, exactly as
+		// VertexBufferGl46.BindColorMesh rebinds the attribute in GL.
+		if (hasColorMesh)
+			attributes[(int)LocSpecular] = new VertexInputAttributeDescription(LocSpecular, ColorMeshBinding, Format.R8G8B8A8Unorm, 0);
 
 		// Wrinkle is not part of the GL vertex layout either (RecomputeVAO disables it).
 		return offset;

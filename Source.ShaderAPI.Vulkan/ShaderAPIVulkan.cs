@@ -666,7 +666,7 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 			return;
 
 		if (RenderMesh != null) {
-			readyToDraw = PrepareDraw(RenderMesh.GetVertexFormat(), RenderMesh.GetPrimitiveType());
+			readyToDraw = PrepareDraw(RenderMesh.GetVertexFormat(), RenderMesh.GetPrimitiveType(), RenderMesh.GetColorMeshStride());
 			RenderMesh.RenderPass();
 			readyToDraw = false;
 		}
@@ -677,7 +677,7 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		MeshMgr?.Flush();
 	}
 
-	unsafe bool PrepareDraw(VertexFormat format, MaterialPrimitiveType topology) {
+	unsafe bool PrepareDraw(VertexFormat format, MaterialPrimitiveType topology, int colorMeshStride) {
 		if (!EnsureRendering())
 			return false;
 
@@ -704,7 +704,8 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 			Format = format,
 			Topology = topology,
 			ColorFormat = currentColorFormat,
-			DepthFormat = currentDepthFormat
+			DepthFormat = currentDepthFormat,
+			ColorMeshStride = colorMeshStride
 		};
 		Pipeline pipeline = pipelines!.GetPipeline(in key);
 		if (pipeline.Handle == 0)
@@ -846,7 +847,8 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		height = (int)(swapchain?.Extent.Height ?? 0);
 	}
 
-	internal unsafe bool BindMeshBuffers(VertexBufferVulkan vertexBuffer, IndexBufferVulkan indexBuffer) {
+	internal unsafe bool BindMeshBuffers(VertexBufferVulkan vertexBuffer, IndexBufferVulkan indexBuffer,
+		VertexBufferVulkan? colorMesh = null, int colorMeshOffset = 0) {
 		if (!readyToDraw || frameLoop is not { FrameActive: true })
 			return false;
 
@@ -858,9 +860,12 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		Vk vk = core!.Vk;
 		CommandBuffer cmd = frameLoop.Cmd;
 
-		VkBuffer* buffers = stackalloc VkBuffer[2] { vb.Handle, pipelines!.ZeroVertexBuffer };
-		ulong* offsets = stackalloc ulong[2] { 0, 0 };
-		vk.CmdBindVertexBuffers(cmd, 0, 2, buffers, offsets);
+		VulkanBufferResource? colorBuffer = colorMesh?.Buffer;
+		uint count = colorBuffer != null ? 3u : 2u;
+
+		VkBuffer* buffers = stackalloc VkBuffer[3] { vb.Handle, pipelines!.ZeroVertexBuffer, colorBuffer?.Handle ?? default };
+		ulong* offsets = stackalloc ulong[3] { 0, 0, (ulong)colorMeshOffset };
+		vk.CmdBindVertexBuffers(cmd, 0, count, buffers, offsets);
 		vk.CmdBindIndexBuffer(cmd, ib.Handle, 0, IndexType.Uint16);
 		return true;
 	}

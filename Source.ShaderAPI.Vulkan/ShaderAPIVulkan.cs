@@ -403,11 +403,35 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	public void LoadMatrix(in Matrix4x4 matrix) {
 		Matrices[(int)currentMatrixMode] = matrix;
 		UploadMatrices();
+		if (currentMatrixMode == MaterialMatrixMode.View)
+			UpdateWorldSpaceCameraPosition();
 	}
 
 	public void LoadIdentity() {
 		Matrices[(int)currentMatrixMode] = Matrix4x4.Identity;
 		UploadMatrices();
+		if (currentMatrixMode == MaterialMatrixMode.View)
+			UpdateWorldSpaceCameraPosition();
+	}
+
+	/// <summary>
+	/// Camera position in world space, which shaders read from vs_const[CameraPos] for view
+	/// vectors (cubemap reflections, water fresnel). GL derives this whenever the view matrix is
+	/// loaded; without it the constant stays zero and every view vector points at the origin.
+	/// </summary>
+	void UpdateWorldSpaceCameraPosition() {
+		ref Matrix4x4 view = ref Matrices[(int)MaterialMatrixMode.View];
+
+		float x = -(view.M41 * view.M11 + view.M42 * view.M12 + view.M43 * view.M13);
+		float y = -(view.M41 * view.M21 + view.M42 * view.M22 + view.M43 * view.M23);
+		float z = -(view.M41 * view.M31 + view.M42 * view.M32 + view.M43 * view.M33);
+
+		// Some pixel shaders divide by z, so keep it away from zero (GL does the same).
+		if (MathF.Abs(z) <= 0.00001f)
+			z = 0.01f;
+
+		Span<float> cameraPos = [x, y, z, 0.0f];
+		SetVertexShaderConstant(VertexShaderConst.CameraPos, cameraPos);
 	}
 
 	public void GetMatrix(MaterialMatrixMode matrixMode, out Matrix4x4 dst) => dst = Matrices[(int)matrixMode];

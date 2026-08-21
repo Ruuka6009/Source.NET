@@ -27,6 +27,14 @@ public struct VulkanPipelineKey : IEquatable<VulkanPipelineKey>
 	/// <summary>Stride of the static prop lighting stream, 0 when no color mesh is bound.</summary>
 	public int ColorMeshStride;
 
+	// Stencil ops and compare are baked into the pipeline; reference and the masks are dynamic
+	// state, since Source changes those far more often than it changes the operations.
+	public bool StencilEnable;
+	public StencilOperation StencilFail;
+	public StencilOperation StencilZFail;
+	public StencilOperation StencilPass;
+	public StencilComparisonFunction StencilFunc;
+
 	public readonly bool Equals(VulkanPipelineKey other) {
 		ref readonly GraphicsBoardState a = ref State;
 		ref readonly GraphicsBoardState b = ref other.State;
@@ -37,6 +45,11 @@ public struct VulkanPipelineKey : IEquatable<VulkanPipelineKey>
 			&& ColorFormat == other.ColorFormat
 			&& DepthFormat == other.DepthFormat
 			&& ColorMeshStride == other.ColorMeshStride
+			&& StencilEnable == other.StencilEnable
+			&& StencilFail == other.StencilFail
+			&& StencilZFail == other.StencilZFail
+			&& StencilPass == other.StencilPass
+			&& StencilFunc == other.StencilFunc
 			&& a.Blending == b.Blending
 			&& a.SourceBlend == b.SourceBlend
 			&& a.DestinationBlend == b.DestinationBlend
@@ -67,6 +80,8 @@ public struct VulkanPipelineKey : IEquatable<VulkanPipelineKey>
 		hash.Add(ColorFormat);
 		hash.Add(DepthFormat);
 		hash.Add(ColorMeshStride);
+		hash.Add(StencilEnable);
+		hash.Add(StencilFunc);
 		hash.Add(State.Blending);
 		hash.Add(State.SourceBlend);
 		hash.Add(State.DestinationBlend);
@@ -647,6 +662,29 @@ public unsafe class VulkanPipelineSystem : IDisposable
 		_ => BlendFactor.One
 	};
 
+	static StencilOp MapStencilOp(StencilOperation op) => op switch {
+		StencilOperation.Keep => StencilOp.Keep,
+		StencilOperation.Zero => StencilOp.Zero,
+		StencilOperation.Replace => StencilOp.Replace,
+		StencilOperation.IncrSat => StencilOp.IncrementAndClamp,
+		StencilOperation.DecrSat => StencilOp.DecrementAndClamp,
+		StencilOperation.Invert => StencilOp.Invert,
+		StencilOperation.Incr => StencilOp.IncrementAndWrap,
+		StencilOperation.Decr => StencilOp.DecrementAndWrap,
+		_ => StencilOp.Keep
+	};
+
+	static CompareOp MapStencilFunc(StencilComparisonFunction func) => func switch {
+		StencilComparisonFunction.Never => CompareOp.Never,
+		StencilComparisonFunction.Less => CompareOp.Less,
+		StencilComparisonFunction.Equal => CompareOp.Equal,
+		StencilComparisonFunction.LessEqual => CompareOp.LessOrEqual,
+		StencilComparisonFunction.Greater => CompareOp.Greater,
+		StencilComparisonFunction.NotEqual => CompareOp.NotEqual,
+		StencilComparisonFunction.GreaterEqual => CompareOp.GreaterOrEqual,
+		_ => CompareOp.Always
+	};
+
 	static BlendOp MapBlendOp(ShaderBlendOp op) => op switch {
 		ShaderBlendOp.Add => BlendOp.Add,
 		ShaderBlendOp.Subtract => BlendOp.Subtract,
@@ -744,11 +782,21 @@ public unsafe class VulkanPipelineSystem : IDisposable
 				AlphaToCoverageEnable = state.AlphaToCoverage
 			};
 
+			StencilOpState stencilOp = new() {
+				FailOp = MapStencilOp(key.StencilFail),
+				PassOp = MapStencilOp(key.StencilPass),
+				DepthFailOp = MapStencilOp(key.StencilZFail),
+				CompareOp = MapStencilFunc(key.StencilFunc)
+				// Reference/CompareMask/WriteMask are dynamic state.
+			};
 			PipelineDepthStencilStateCreateInfo depthStencil = new() {
 				SType = StructureType.PipelineDepthStencilStateCreateInfo,
 				DepthTestEnable = state.DepthTest,
 				DepthWriteEnable = state.DepthWrite,
-				DepthCompareOp = MapDepthFunc(state.DepthFunc)
+				DepthCompareOp = MapDepthFunc(state.DepthFunc),
+				StencilTestEnable = key.StencilEnable,
+				Front = stencilOp,
+				Back = stencilOp
 			};
 
 			ColorComponentFlags writeMask = 0;
@@ -773,10 +821,13 @@ public unsafe class VulkanPipelineSystem : IDisposable
 				PAttachments = &blendAttachment
 			};
 
-			DynamicState* dynamicStates = stackalloc DynamicState[2] { DynamicState.Viewport, DynamicState.Scissor };
+			DynamicState* dynamicStates = stackalloc DynamicState[5] {
+				DynamicState.Viewport, DynamicState.Scissor,
+				DynamicState.StencilReference, DynamicState.StencilCompareMask, DynamicState.StencilWriteMask
+			};
 			PipelineDynamicStateCreateInfo dynamic = new() {
 				SType = StructureType.PipelineDynamicStateCreateInfo,
-				DynamicStateCount = 2,
+				DynamicStateCount = 5,
 				PDynamicStates = dynamicStates
 			};
 
@@ -785,7 +836,12 @@ public unsafe class VulkanPipelineSystem : IDisposable
 				SType = StructureType.PipelineRenderingCreateInfo,
 				ColorAttachmentCount = 1,
 				PColorAttachmentFormats = &colorFormat,
-				DepthAttachmentFormat = key.DepthFormat
+				DepthAttachmentFormat = key.DepthFormat,
+				// Must match the pass: a stencil attachment is present whenever the depth format
+				// carries a stencil aspect.
+				StencilAttachmentFormat = VulkanFrameLoop.FormatHasStencil(key.DepthFormat)
+					? key.DepthFormat
+					: VkFormat.Undefined
 			};
 
 			GraphicsPipelineCreateInfo pipelineInfo = new() {

@@ -705,7 +705,12 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 			Topology = topology,
 			ColorFormat = currentColorFormat,
 			DepthFormat = currentDepthFormat,
-			ColorMeshStride = colorMeshStride
+			ColorMeshStride = colorMeshStride,
+			StencilEnable = stencilEnable,
+			StencilFail = stencilFail,
+			StencilZFail = stencilZFail,
+			StencilPass = stencilPass,
+			StencilFunc = stencilFunc
 		};
 		Pipeline pipeline = pipelines!.GetPipeline(in key);
 		if (pipeline.Handle == 0)
@@ -742,6 +747,10 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		}
 
 		ApplyViewportAndScissor(vk, cmd);
+
+		vk.CmdSetStencilReference(cmd, StencilFaceFlags.FaceFrontAndBack, stencilReference);
+		vk.CmdSetStencilCompareMask(cmd, StencilFaceFlags.FaceFrontAndBack, stencilTestMask);
+		vk.CmdSetStencilWriteMask(cmd, StencilFaceFlags.FaceFrontAndBack, stencilWriteMask);
 		return true;
 	}
 
@@ -1248,7 +1257,7 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		}
 		else if (renderTargetDepth != null) {
 			ImageView depthView = textureManager!.GetView(renderTargetDepth);
-			TransitionTexture(cmd, renderTargetDepth, ImageLayout.DepthAttachmentOptimal);
+			TransitionTexture(cmd, renderTargetDepth, DepthLayoutFor(renderTargetDepth.VkFormat));
 			target.DepthView = depthView;
 			target.DepthFormat = renderTargetDepth.VkFormat;
 			target.Extent = MinExtent(target.Extent, new Extent2D((uint)renderTargetDepth.Width, (uint)renderTargetDepth.Height));
@@ -1256,7 +1265,7 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		else if (renderTargetColor != null) {
 			// Sharing the backbuffer's depth buffer: the pass can only cover what both can hold.
 			target.DepthView = frameLoop.SharedDepthView;
-			target.DepthFormat = VulkanFrameLoop.DepthFormat;
+			target.DepthFormat = frameLoop.DepthFormat;
 			target.Extent = MinExtent(target.Extent, frameLoop.SharedDepthExtent);
 		}
 
@@ -1265,6 +1274,10 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 
 		frameLoop.BeginRendering(in target, clear, clearR, clearG, clearB, discard);
 	}
+
+	static ImageLayout DepthLayoutFor(Format format) => VulkanFrameLoop.FormatHasStencil(format)
+		? ImageLayout.DepthStencilAttachmentOptimal
+		: ImageLayout.DepthAttachmentOptimal;
 
 	static Extent2D MinExtent(Extent2D a, Extent2D b) =>
 		new(Math.Min(a.Width, b.Width), Math.Min(a.Height, b.Height));
@@ -1279,8 +1292,11 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		if (old == newLayout)
 			return;
 
-		bool depth = newLayout == ImageLayout.DepthAttachmentOptimal || texture.IsDepth;
-		ImageAspectFlags aspect = depth ? ImageAspectFlags.DepthBit : ImageAspectFlags.ColorBit;
+		bool depth = newLayout is ImageLayout.DepthAttachmentOptimal or ImageLayout.DepthStencilAttachmentOptimal || texture.IsDepth;
+		ImageAspectFlags aspect = !depth ? ImageAspectFlags.ColorBit
+			: VulkanFrameLoop.FormatHasStencil(texture.VkFormat)
+				? ImageAspectFlags.DepthBit | ImageAspectFlags.StencilBit
+				: ImageAspectFlags.DepthBit;
 
 		(PipelineStageFlags2 srcStage, AccessFlags2 srcAccess) = LayoutAccess(old, texture.IsDepth);
 		(PipelineStageFlags2 dstStage, AccessFlags2 dstAccess) = LayoutAccess(newLayout, texture.IsDepth);
@@ -1295,7 +1311,7 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		ImageLayout.Undefined => (PipelineStageFlags2.TopOfPipeBit, AccessFlags2.None),
 		ImageLayout.TransferDstOptimal => (PipelineStageFlags2.TransferBit, AccessFlags2.TransferWriteBit),
 		ImageLayout.ColorAttachmentOptimal => (PipelineStageFlags2.ColorAttachmentOutputBit, AccessFlags2.ColorAttachmentWriteBit),
-		ImageLayout.DepthAttachmentOptimal => (
+		ImageLayout.DepthAttachmentOptimal or ImageLayout.DepthStencilAttachmentOptimal => (
 			PipelineStageFlags2.EarlyFragmentTestsBit | PipelineStageFlags2.LateFragmentTestsBit,
 			AccessFlags2.DepthStencilAttachmentReadBit | AccessFlags2.DepthStencilAttachmentWriteBit),
 		ImageLayout.ShaderReadOnlyOptimal => (PipelineStageFlags2.FragmentShaderBit, AccessFlags2.ShaderReadBit),
@@ -1317,14 +1333,70 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	}
 	public void SetScissorRect(int left, int top, int right, int bottom, bool enableScissor) { }
 
-	public void SetStencilEnable(bool onoff) { }
-	public void SetStencilFailOperation(StencilOperation op) { }
-	public void SetStencilZFailOperation(StencilOperation op) { }
-	public void SetStencilPassOperation(StencilOperation op) { }
-	public void SetStencilCompareFunction(StencilComparisonFunction cmpfn) { }
-	public void SetStencilReferenceValue(int reference) { }
-	public void SetStencilTestMask(uint msk) { }
-	public void SetStencilWriteMask(uint msk) { }
+	bool stencilEnable;
+	StencilOperation stencilFail = StencilOperation.Keep;
+	StencilOperation stencilZFail = StencilOperation.Keep;
+	StencilOperation stencilPass = StencilOperation.Keep;
+	StencilComparisonFunction stencilFunc = StencilComparisonFunction.Always;
+	uint stencilReference;
+	uint stencilTestMask = 0xFFFFFFFF;
+	uint stencilWriteMask = 0xFFFFFFFF;
+
+	public void SetStencilEnable(bool onoff) {
+		if (stencilEnable == onoff)
+			return;
+		FlushBufferedPrimitives();
+		stencilEnable = onoff;
+	}
+
+	public void SetStencilFailOperation(StencilOperation op) {
+		if (stencilFail == op)
+			return;
+		FlushBufferedPrimitives();
+		stencilFail = op;
+	}
+
+	public void SetStencilZFailOperation(StencilOperation op) {
+		if (stencilZFail == op)
+			return;
+		FlushBufferedPrimitives();
+		stencilZFail = op;
+	}
+
+	public void SetStencilPassOperation(StencilOperation op) {
+		if (stencilPass == op)
+			return;
+		FlushBufferedPrimitives();
+		stencilPass = op;
+	}
+
+	public void SetStencilCompareFunction(StencilComparisonFunction cmpfn) {
+		if (stencilFunc == cmpfn)
+			return;
+		FlushBufferedPrimitives();
+		stencilFunc = cmpfn;
+	}
+
+	public void SetStencilReferenceValue(int reference) {
+		if (stencilReference == (uint)reference)
+			return;
+		FlushBufferedPrimitives();
+		stencilReference = (uint)reference;
+	}
+
+	public void SetStencilTestMask(uint msk) {
+		if (stencilTestMask == msk)
+			return;
+		FlushBufferedPrimitives();
+		stencilTestMask = msk;
+	}
+
+	public void SetStencilWriteMask(uint msk) {
+		if (stencilWriteMask == msk)
+			return;
+		FlushBufferedPrimitives();
+		stencilWriteMask = msk;
+	}
 
 	public const int MaxNumLights = 4;
 

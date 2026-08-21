@@ -12,7 +12,23 @@ namespace Source.ShaderAPI.Vulkan;
 public unsafe class VulkanFrameLoop : IDisposable
 {
 	public const int FramesInFlight = 2;
-	public const Format DepthFormat = Format.D32Sfloat;
+	/// <summary>
+	/// Depth format in use. Chosen at init and carries a stencil aspect, which Source needs for
+	/// shadow and effect masking.
+	/// </summary>
+	public Format DepthFormat { get; private set; } = Format.D32SfloatS8Uint;
+
+	ImageAspectFlags DepthAspect => FormatHasStencil(DepthFormat)
+		? ImageAspectFlags.DepthBit | ImageAspectFlags.StencilBit
+		: ImageAspectFlags.DepthBit;
+
+	/// <summary>
+	/// Attachment layout for the depth buffer. A format carrying a stencil aspect may not use the
+	/// depth-only layouts.
+	/// </summary>
+	public ImageLayout DepthAttachmentLayout => FormatHasStencil(DepthFormat)
+		? ImageLayout.DepthStencilAttachmentOptimal
+		: ImageLayout.DepthAttachmentOptimal;
 
 	readonly VulkanCore core;
 	readonly VulkanSwapchain swapchain;
@@ -106,10 +122,22 @@ public unsafe class VulkanFrameLoop : IDisposable
 		return CreateDepthBuffer();
 	}
 
+	/// <summary>Picks the first depth+stencil format the device can use as an attachment.</summary>
+	Format ChooseDepthFormat() {
+		foreach (Format candidate in new[] { Format.D32SfloatS8Uint, Format.D24UnormS8Uint }) {
+			core.Vk.GetPhysicalDeviceFormatProperties(core.PhysicalDevice, candidate, out FormatProperties props);
+			if ((props.OptimalTilingFeatures & FormatFeatureFlags.DepthStencilAttachmentBit) != 0)
+				return candidate;
+		}
+		Warning("Vulkan: no depth+stencil format available; stencil will not work\n");
+		return Format.D32Sfloat;
+	}
+
 	bool CreateDepthBuffer() {
 		Vk vk = core.Vk;
 
 		DestroyDepthBuffer();
+		DepthFormat = ChooseDepthFormat();
 
 		ImageCreateInfo imageInfo = new() {
 			SType = StructureType.ImageCreateInfo,
@@ -138,7 +166,7 @@ public unsafe class VulkanFrameLoop : IDisposable
 			Image = depthImage,
 			ViewType = ImageViewType.Type2D,
 			Format = DepthFormat,
-			SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.DepthBit, 0, 1, 0, 1)
+			SubresourceRange = new ImageSubresourceRange(DepthAspect, 0, 1, 0, 1)
 		};
 		if (vk.CreateImageView(core.Device, &viewInfo, null, out depthImageView) != Result.Success) {
 			Warning("Vulkan: depth image view creation failed\n");
@@ -201,8 +229,8 @@ public unsafe class VulkanFrameLoop : IDisposable
 			PipelineStageFlags2.TopOfPipeBit, 0,
 			PipelineStageFlags2.ColorAttachmentOutputBit, AccessFlags2.ColorAttachmentWriteBit);
 
-		TransitionImage(cmd, depthImage, ImageAspectFlags.DepthBit,
-			ImageLayout.Undefined, ImageLayout.DepthAttachmentOptimal,
+		TransitionImage(cmd, depthImage, DepthAspect,
+			ImageLayout.Undefined, DepthAttachmentLayout,
 			PipelineStageFlags2.TopOfPipeBit, 0,
 			PipelineStageFlags2.EarlyFragmentTestsBit | PipelineStageFlags2.LateFragmentTestsBit,
 			AccessFlags2.DepthStencilAttachmentReadBit | AccessFlags2.DepthStencilAttachmentWriteBit);
@@ -261,7 +289,9 @@ public unsafe class VulkanFrameLoop : IDisposable
 		RenderingAttachmentInfo depthAttachment = new() {
 			SType = StructureType.RenderingAttachmentInfo,
 			ImageView = target.DepthView,
-			ImageLayout = ImageLayout.DepthAttachmentOptimal,
+			ImageLayout = FormatHasStencil(target.DepthFormat)
+				? ImageLayout.DepthStencilAttachmentOptimal
+				: ImageLayout.DepthAttachmentOptimal,
 			// Depth is never preserved across passes (the engine clears it when it matters), and
 			// StoreOp.DontCare lets tilers drop it entirely.
 			LoadOp = clearColor ? AttachmentLoadOp.Clear : AttachmentLoadOp.Load,
@@ -269,17 +299,23 @@ public unsafe class VulkanFrameLoop : IDisposable
 			ClearValue = new ClearValue(depthStencil: new ClearDepthStencilValue(1.0f, 0))
 		};
 
+		RenderingAttachmentInfo stencilAttachment = depthAttachment;
+
 		RenderingInfo renderingInfo = new() {
 			SType = StructureType.RenderingInfo,
 			RenderArea = new Rect2D(new Offset2D(0, 0), target.Extent),
 			LayerCount = 1,
 			ColorAttachmentCount = 1,
 			PColorAttachments = &colorAttachment,
-			PDepthAttachment = target.DepthView.Handle != 0 ? &depthAttachment : null
+			PDepthAttachment = target.DepthView.Handle != 0 ? &depthAttachment : null,
+			PStencilAttachment = target.DepthView.Handle != 0 && FormatHasStencil(target.DepthFormat) ? &stencilAttachment : null
 		};
 		core.Vk.CmdBeginRendering(commandBuffers[currentFrame], &renderingInfo);
 		RenderingActive = true;
 	}
+
+	public static bool FormatHasStencil(Format format) =>
+		format is Format.D32SfloatS8Uint or Format.D24UnormS8Uint or Format.D16UnormS8Uint or Format.S8Uint;
 
 	public void EndRendering() {
 		if (!RenderingActive)
@@ -331,7 +367,7 @@ public unsafe class VulkanFrameLoop : IDisposable
 		}
 		if (clearDepth) {
 			clears[count++] = new ClearAttachment {
-				AspectMask = ImageAspectFlags.DepthBit,
+				AspectMask = FormatHasStencil(DepthFormat) ? DepthAspect : ImageAspectFlags.DepthBit,
 				ClearValue = new ClearValue(depthStencil: new ClearDepthStencilValue(1.0f, 0))
 			};
 		}

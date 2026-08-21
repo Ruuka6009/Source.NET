@@ -159,9 +159,24 @@ Buffers/depth done 2026-08-21 (session 3); textures are the next milestone.
       Fine for the rects the engine actually locks; revisit if a partial-update case appears.
 - [ ] `DeleteTexture` does a full `vkDeviceWaitIdle` before freeing. Correct but heavy — replace
       with the frame-tick retire queue the buffers already use.
-- [ ] Then render targets (`SetRenderTargetEx` warns and draws to the backbuffer today): dynamic
-      rendering to texture RTs + layout transitions + `DoRenderTargetsNeedSeparateDepthBuffer`.
-      This is the next milestone, and the last big piece before world rendering.
+- [x] **Render targets — done 2026-08-21 (session 4), runtime-verified: `_rt_FullFrameFB` and
+      `_rt_FullFrameFB1` are bound and rendered into with zero validation errors.**
+  - The frame loop no longer owns a single pass. `BeginFrame` acquires the image and opens the
+    command buffer; the shader API opens/closes a pass per render target via `BeginRendering`/
+    `EndRendering`, so targets can be switched mid-frame.
+  - `SetRenderTargetEx` records the target and marks it dirty; the next draw or clear closes the
+    open pass, transitions attachments, and reopens. A texture being switched away from goes back
+    to `ShaderReadOnlyOptimal` so it can be sampled immediately.
+  - Load ops: the frame's first backbuffer pass clears, a target with no contents yet uses
+    `DontCare`, everything else loads. `VulkanTexture.RenderedTo` makes an RT sampleable even
+    though nothing was ever uploaded into it.
+  - A target that borrows the shared depth buffer clamps the render area to the smaller of the
+    two extents; viewports are clamped to the attachment (invalid in Vulkan, silently clamped
+    by GL).
+  - The pipeline key now carries the *current* target's colour/depth formats rather than the
+    swapchain's.
+- [ ] Only render target 0 is wired up; MRT would need the extra views in the pipeline key.
+- [ ] Stencil state is still ignored, and the shared depth buffer is D32 with no stencil aspect.
 - [x] Bones: GL only ever uploads bone 0 = transposed model matrix (`SetSkinningMatrices`) +
       `LoadBoneMatrix` per-bone transposed writes — mirrored into the bones CPU block, dirty-flagged.
 - [ ] Color meshes (static prop lighting streams) warn-once and are ignored; stencil state is

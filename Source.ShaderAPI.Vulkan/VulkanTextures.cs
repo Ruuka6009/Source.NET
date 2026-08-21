@@ -12,9 +12,8 @@ using VkSampler = Silk.NET.Vulkan.Sampler;
 namespace Source.ShaderAPI.Vulkan;
 
 /// <summary>
-/// Per-texture sampler state. GL sets these with glTextureParameteri on the texture object; in
-/// Vulkan samplers are separate objects, so the state is recorded here and resolved through a
-/// cache at bind time (there are only a handful of distinct combinations).
+/// Per-texture sampler state. GL sets these on the texture object; in Vulkan samplers are
+/// separate objects, so the state is recorded here and resolved through a cache at bind time.
 /// </summary>
 public struct SamplerDesc : IEquatable<SamplerDesc>
 {
@@ -46,9 +45,8 @@ public struct SamplerDesc : IEquatable<SamplerDesc>
 }
 
 /// <summary>
-/// One texture as the material system sees it. May hold several GPU copies (GL's NumCopies, used
-/// for textures updated while previous frames are still in flight); <see cref="CurrentCopy"/>
-/// selects the one that reads and writes land on.
+/// One texture as the material system sees it. May hold several GPU copies (GL's NumCopies);
+/// <see cref="CurrentCopy"/> selects the one reads and writes land on.
 /// </summary>
 public unsafe class VulkanTexture
 {
@@ -74,21 +72,20 @@ public unsafe class VulkanTexture
 
 	public int CurrentCopy;
 	public bool SwitchNeeded;
+	/// <summary>Set once the texture has been used as a render target, so it is sampleable.</summary>
+	public bool RenderedTo;
 
 	public SamplerDesc Sampler = SamplerDesc.Default;
 
-	public bool HasContent => TopMipUploaded.Length > 0 && TopMipUploaded[CurrentCopy] >= 0;
+	public bool HasContent => RenderedTo || (TopMipUploaded.Length > 0 && TopMipUploaded[CurrentCopy] >= 0);
 	public Image CurrentImage => Images[CurrentCopy];
 }
 
 /// <summary>
-/// Creates VkImages for the material system's textures and streams pixels into them.
-///
-/// Uploads are recorded into a dedicated command buffer (never the frame's, which is inside a
-/// dynamic rendering pass where copies are illegal) and flushed with a fence wait. Flushes happen
-/// when the staging ring fills up and before each frame begins, so load-time uploads batch into a
-/// few submits; an upload requested mid-frame flushes immediately so the draw that follows sees
-/// the pixels.
+/// Creates VkImages for the material system's textures and streams pixels into them. Uploads are
+/// recorded into a dedicated command buffer - not the frame's, which is inside a rendering pass
+/// where copies are illegal - and flushed with a fence wait when the staging ring fills, before
+/// each frame, and before any draw that would sample a pending upload.
 /// </summary>
 public unsafe class VulkanTextureManager : IDisposable
 {
@@ -148,23 +145,17 @@ public unsafe class VulkanTextureManager : IDisposable
 		return true;
 	}
 
-	// ------------------------------------------------------------------
-	// Creation
-	// ------------------------------------------------------------------
-
 	public VulkanTexture? Create(int width, int height, int depth, ImageFormat format, int mipCount, int copies,
 		CreateTextureFlags flags, ReadOnlySpan<char> debugName) {
 		Vk vk = core.Vk;
 
-		// NV_NULL is Source's "takes no video memory" dummy; nothing to allocate, and anything
-		// binding it falls back to white.
+		// NV_NULL takes no video memory; anything binding it falls back to white.
 		if (format == ImageFormat.NV_NULL)
 			return null;
 
 		ImageFormat storage = ImageFormatVulkan.GetStorageFormat(format);
-		// CreateTextureFlags.SRGB is deliberately ignored: the GL backend never enables
-		// GL_FRAMEBUFFER_SRGB nor picks sRGB internal formats, and the swapchain is UNORM to
-		// match it. Sampling through _Srgb views would gamma-correct once more than -gl does.
+		// SRGB is ignored for parity with GL, which never enables GL_FRAMEBUFFER_SRGB. The
+		// swapchain is UNORM to match, so an _Srgb view would gamma-correct one time too many.
 		VkFormat vkFormat = ImageFormatVulkan.ToVkFormat(storage);
 		if (vkFormat == VkFormat.Undefined) {
 			Warning($"Vulkan: unsupported texture format {format} for '{debugName}'\n");
@@ -253,13 +244,9 @@ public unsafe class VulkanTextureManager : IDisposable
 		}
 	}
 
-	// ------------------------------------------------------------------
-	// Views and samplers (resolved at bind time)
-	// ------------------------------------------------------------------
-
 	/// <summary>
-	/// The view covers only the mips actually uploaded: a VTF that supplies fewer levels than the
-	/// image was created with would otherwise sample uninitialised memory at the small end.
+	/// Covers only the mips actually uploaded; a VTF with fewer levels than the image was created
+	/// with would otherwise sample uninitialised memory at the small end.
 	/// </summary>
 	public ImageView GetView(VulkanTexture texture) {
 		int copy = texture.CurrentCopy;
@@ -286,8 +273,7 @@ public unsafe class VulkanTextureManager : IDisposable
 
 	void InvalidateView(VulkanTexture texture, int copy) {
 		if (texture.Views[copy].Handle != 0) {
-			// The view is replaced rather than destroyed immediately: a previous frame may still
-			// reference it from a descriptor set.
+			// A previous frame may still reference this view from a descriptor set.
 			retiredViews.Add((texture.Views[copy], VulkanFrameLoop.FramesInFlight + 1));
 			texture.Views[copy] = default;
 		}
@@ -334,13 +320,9 @@ public unsafe class VulkanTextureManager : IDisposable
 		return sampler;
 	}
 
-	// ------------------------------------------------------------------
-	// Uploads
-	// ------------------------------------------------------------------
-
 	/// <summary>
-	/// Copies one mip (of one cube face) into the texture. <paramref name="srcStride"/> is the
-	/// source row pitch in bytes, or 0 when the source rows are tightly packed.
+	/// Copies one mip of one cube face. <paramref name="srcStride"/> is the source row pitch in
+	/// bytes, or 0 when the rows are tightly packed.
 	/// </summary>
 	public void Upload(VulkanTexture texture, int mip, int face, ImageFormat srcFormat,
 		int width, int height, ReadOnlySpan<byte> data, int srcStride = 0) {
@@ -363,8 +345,7 @@ public unsafe class VulkanTextureManager : IDisposable
 			srcStride = 0;
 		}
 
-		// Reserve tightly packed staging space; a strided source is de-strided row by row so the
-		// copy never needs BufferRowLength.
+		// Staging is tightly packed; strided sources are de-strided row by row.
 		int srcPitch = srcStride > 0 ? srcStride : dstPitch;
 		if (!ReserveStaging(dstSize, out ulong stagingOffset)) {
 			Warning($"Vulkan: texture upload of {dstSize} bytes exceeds the {StagingSize} byte staging buffer; skipping '{texture.DebugName}'\n");

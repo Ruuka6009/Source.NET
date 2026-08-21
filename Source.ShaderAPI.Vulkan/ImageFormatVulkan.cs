@@ -9,20 +9,16 @@ namespace Source.ShaderAPI.Vulkan;
 
 /// <summary>
 /// Translates the driver-neutral <see cref="ImageFormat"/> enum into Vulkan formats - the sibling
-/// of <c>ImageFormatGl46</c>. Vulkan has far fewer "the driver will sort it out" conversions than
-/// GL: three-byte and packed-16-bit layouts are not reliably sampleable, so this module also owns
-/// the CPU-side conversion to a format that is.
-///
-/// <see cref="GetStorageFormat"/> is the single source of truth: it says which ImageFormat the
-/// pixels are actually *stored* in on the GPU. Anything whose storage format differs from its
-/// source format goes through <see cref="Convert"/> on upload.
+/// of <c>ImageFormatGl46</c>. Three-byte and packed-16-bit layouts are not reliably sampleable in
+/// Vulkan, so this also owns the CPU-side conversion to one that is: <see cref="GetStorageFormat"/>
+/// says what the pixels are stored as, and anything that differs from its source format goes
+/// through <see cref="Convert"/> on upload.
 /// </summary>
 public static class ImageFormatVulkan
 {
 	/// <summary>The format the GPU copy is kept in - equals the input unless a conversion is required.</summary>
 	public static ImageFormat GetStorageFormat(ImageFormat format) => format switch {
-		// Layouts Vulkan implementations do not reliably support for sampled images
-		// (3-byte RGB, packed 16-bit, and the odd channel orders) become plain RGBA8888.
+		// Layouts not reliably supported for sampled images become plain RGBA8888.
 		ImageFormat.RGB888 or ImageFormat.BGR888 or
 		ImageFormat.RGB888_Bluescreen or ImageFormat.BGR888_Bluescreen or
 		ImageFormat.ARGB8888 or ImageFormat.ABGR8888 or ImageFormat.BGRX8888 or
@@ -41,7 +37,7 @@ public static class ImageFormatVulkan
 		ImageFormat.BGRA8888 => srgb ? VkFormat.B8G8R8A8Srgb : VkFormat.B8G8R8A8Unorm,
 		ImageFormat.UVWQ8888 or ImageFormat.UVLX8888 => VkFormat.R8G8B8A8Unorm,
 
-		// GL maps I8 to GL_R8 (samples as r,0,0,1); keep the same behaviour rather than "fixing" it.
+		// GL maps I8 to GL_R8 (samples as r,0,0,1); keep the same behaviour.
 		ImageFormat.I8 => VkFormat.R8Unorm,
 		ImageFormat.IA88 or ImageFormat.UV88 => VkFormat.R8G8Unorm,
 
@@ -87,9 +83,8 @@ public static class ImageFormatVulkan
 	}
 
 	/// <summary>
-	/// Converts one image's pixels from <paramref name="srcFormat"/> into its storage format.
-	/// Only called for formats where <see cref="RequiresConversion"/> is true, all of which
-	/// target RGBA8888.
+	/// Converts pixels from <paramref name="srcFormat"/> into its storage format. Only called
+	/// where <see cref="RequiresConversion"/> is true, all of which target RGBA8888.
 	/// </summary>
 	public static void Convert(ImageFormat srcFormat, ReadOnlySpan<byte> src, Span<byte> dst) {
 		int pixels = Math.Min(src.Length / Math.Max(srcFormat.SizeInBytes(), 1), dst.Length / 4);
@@ -134,7 +129,7 @@ public static class ImageFormatVulkan
 				break;
 
 			case ImageFormat.BGRX8888:
-				// X carries no alpha - force opaque rather than sampling whatever was in the pad byte.
+				// X carries no alpha; force opaque rather than sampling the pad byte.
 				for (int i = 0; i < pixels; i++) {
 					dst[i * 4 + 0] = src[i * 4 + 2];
 					dst[i * 4 + 1] = src[i * 4 + 1];

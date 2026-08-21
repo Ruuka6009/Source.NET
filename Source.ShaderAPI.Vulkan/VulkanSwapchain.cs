@@ -3,8 +3,7 @@ using Silk.NET.Vulkan;
 namespace Source.ShaderAPI.Vulkan;
 
 /// <summary>
-/// Swapchain plus its image views. Recreated on resize/alt-tab (the first thing that breaks,
-/// per VULKAN_TODO.md - keep all of that logic here).
+/// Swapchain plus its image views, and all of the resize/alt-tab recreation logic.
 /// </summary>
 public unsafe class VulkanSwapchain : IDisposable
 {

@@ -12,7 +12,7 @@ public struct PrimListVulkan
 }
 
 /// <summary>
-/// Port of MeshGl46 (Phase 4 of VULKAN_TODO.md). Same lock/unlock and prim-list flow; RenderPass
+/// Port of MeshGl46. Same lock/unlock and prim-list flow; RenderPass
 /// records vkCmdBindVertexBuffers/vkCmdBindIndexBuffer/vkCmdDrawIndexed through the shader API,
 /// which has already resolved the pipeline for this mesh's vertex format and topology.
 /// </summary>

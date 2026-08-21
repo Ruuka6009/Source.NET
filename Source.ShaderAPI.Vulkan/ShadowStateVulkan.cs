@@ -24,10 +24,9 @@ public struct PixelSharedStateVulkan
 }
 
 /// <summary>
-/// Snapshot ("shadow") state - Phase 3 of VULKAN_TODO.md. Pure data: captures the full
-/// <see cref="GraphicsBoardState"/> (the pipeline-key half) plus the shared shader uniforms
-/// (the UBO half). Activate() publishes it to the shader API; the actual VkPipeline is resolved
-/// per draw from the pipeline cache.
+/// Snapshot ("shadow") state. Pure data: the full <see cref="GraphicsBoardState"/> (the
+/// pipeline-key half) plus the shared shader uniforms (the UBO half). Activate() publishes it to
+/// the shader API; the VkPipeline itself is resolved per draw from the pipeline cache.
 /// </summary>
 public class ShadowStateVulkan : IShaderShadow
 {
@@ -50,10 +49,6 @@ public class ShadowStateVulkan : IShaderShadow
 		this.shaderAPI = shaderAPI;
 		Name = name.IsEmpty ? null : new(name);
 	}
-
-	// ------------------------------------------------------------------
-	// Board state (pipeline key)
-	// ------------------------------------------------------------------
 
 	public void DepthFunc(ShaderDepthFunc depthFunc) => State.DepthFunc = depthFunc;
 	public void EnableDepthWrites(bool enable) => State.DepthWrite = enable;
@@ -87,10 +82,6 @@ public class ShadowStateVulkan : IShaderShadow
 	public void EnableCulling(bool enable) => State.CullEnable = enable;
 	public void EnableAlphaToCoverage(bool enable) => State.AlphaToCoverage = enable;
 
-	// ------------------------------------------------------------------
-	// Shared uniforms
-	// ------------------------------------------------------------------
-
 	public void EnableAlphaTest(bool enable) => Pixel.IsAlphaTesting = enable ? 1 : 0;
 
 	public void AlphaFunc(ShaderAlphaFunc alphaFunc, float alphaRef) {
@@ -99,10 +90,6 @@ public class ShadowStateVulkan : IShaderShadow
 	}
 
 	public void SetShaderUniform(IMaterialVar textureVar) => shaderUniforms.Add(textureVar);
-
-	// ------------------------------------------------------------------
-	// Shaders / vertex format
-	// ------------------------------------------------------------------
 
 	public void VertexShaderVertexFormat(VertexFormat format, int texCoordCount, Span<int> texCoordDimensions, int userDataSize)
 		=> vertexFormat = format;
@@ -115,12 +102,8 @@ public class ShadowStateVulkan : IShaderShadow
 		PixelShader = shaderAPI.ShaderLoader.LoadPixelShader($"{fileName}_{GetDriver().Extension(ShaderType.Pixel)}");
 	}
 
-	// Combos are ignored for now (see Phase 5 - vertexlitgeneric rework).
+	// Combos are ignored for now; needs the vertexlitgeneric rework.
 	public int GetStaticComboScale(ShaderType type, ReadOnlySpan<char> fileName, ReadOnlySpan<char> name) => 1;
-
-	// ------------------------------------------------------------------
-	// Activation
-	// ------------------------------------------------------------------
 
 	public void Activate() {
 		shaderAPI.SetCurrentShadow(this);
@@ -148,10 +131,6 @@ public class ShadowStateVulkan : IShaderShadow
 		EnablePolyOffset(PolygonOffsetMode.Disable);
 	}
 
-	// ------------------------------------------------------------------
-	// Unsupported fixed-function paths (same NotImplemented surface as the GL backend)
-	// ------------------------------------------------------------------
-
 	public void EnableConstantColor(bool enable) => throw new NotImplementedException();
 	public void EnableVertexBlend(bool enable) => throw new NotImplementedException();
 	public void OverbrightValue(TextureStage stage, float value) => throw new NotImplementedException();
@@ -177,10 +156,6 @@ public class ShadowStateVulkan : IShaderShadow
 	public void SetDiffuseMaterialSource(ShaderMaterialSource materialSource) => throw new NotImplementedException();
 	public void DisableFogGammaCorrection(bool bDisable) => throw new NotImplementedException();
 	public void SetShadowDepthFiltering(Sampler stage) => throw new NotImplementedException();
-
-	// ------------------------------------------------------------------
-	// Queries
-	// ------------------------------------------------------------------
 
 	public GraphicsDriver GetDriver() => shaderAPI.GetDriver();
 	public VertexFormat GetVertexFormat() => vertexFormat;

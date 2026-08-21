@@ -5,14 +5,13 @@ using Source.Common.MaterialSystem;
 namespace Source.ShaderAPI.Vulkan;
 
 /// <summary>
-/// Maps Source's <see cref="VertexFormat"/> onto Vulkan vertex input state. The attribute
-/// locations are the GL backend's shader input contract (OpenGL_ShaderInputAttribute), which the
-/// *_vk13 shaders reuse via layout(location = N). Element offsets follow the exact order of
-/// VertexBufferGl46.ComputeVertexDescription so CPU writes and GPU reads agree.
+/// Maps Source's <see cref="VertexFormat"/> onto Vulkan vertex input state. Attribute locations
+/// are the GL backend's shader input contract (OpenGL_ShaderInputAttribute), which the *_vk13
+/// shaders reuse via layout(location = N), and element offsets follow the same order as
+/// ComputeVertexDescription so CPU writes and GPU reads agree.
 ///
-/// Attributes a format lacks are sourced from a zero buffer at binding 1 with stride 0 (legal in
-/// Vulkan: every vertex reads the same zeros). GL's disabled-attribute default is (0,0,0,1) — the
-/// alpha differs, accepted for bring-up.
+/// Attributes a format lacks read a zero buffer at binding 1 with stride 0. GL's disabled-attribute
+/// default is (0,0,0,1); only the alpha differs.
 /// </summary>
 public static class VulkanVertexLayout
 {

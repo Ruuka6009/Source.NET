@@ -10,8 +10,7 @@ using Source.Common.Launcher;
 namespace Source.ShaderAPI.Vulkan;
 
 /// <summary>
-/// Owns the VkInstance, physical/logical device and queues. Phase 2 of VULKAN_TODO.md:
-/// bring the device up far enough to clear the screen; IShaderAPI comes later.
+/// Owns the VkInstance, physical/logical device and queues.
 /// </summary>
 public unsafe class VulkanCore : IDisposable
 {

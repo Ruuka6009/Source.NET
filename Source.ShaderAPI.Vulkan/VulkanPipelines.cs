@@ -75,10 +75,9 @@ public struct VulkanPipelineKey : IEquatable<VulkanPipelineKey>
 }
 
 /// <summary>
-/// Phase 3 core: descriptor layout contract (set 0 = dynamic-offset UBO ring, set 1 = material
-/// textures, push constant = int flags - see common_vk13.glsl), the per-frame uniform ring
-/// buffers, the placeholder white texture, and the VkPipeline cache keyed on
-/// <see cref="VulkanPipelineKey"/>.
+/// The descriptor layout contract (set 0 = dynamic-offset UBO ring, set 1 = material textures,
+/// push constant = int flags - see common_vk13.glsl), the per-frame uniform ring buffers, the
+/// placeholder white texture, and the VkPipeline cache keyed on <see cref="VulkanPipelineKey"/>.
 /// </summary>
 public unsafe class VulkanPipelineSystem : IDisposable
 {
@@ -245,10 +244,6 @@ public unsafe class VulkanPipelineSystem : IDisposable
 		return false;
 	}
 
-	// ------------------------------------------------------------------
-	// Descriptor pools (grown on demand as materials introduce new texture sets)
-	// ------------------------------------------------------------------
-
 	readonly List<DescriptorPool> descriptorPools = [];
 
 	bool AddDescriptorPool() {
@@ -292,10 +287,6 @@ public unsafe class VulkanPipelineSystem : IDisposable
 		return core.Vk.AllocateDescriptorSets(core.Device, &allocInfo, out set) == Result.Success;
 	}
 
-	// ------------------------------------------------------------------
-	// Uniform ring
-	// ------------------------------------------------------------------
-
 	public void BeginFrame(int frameIndex) {
 		currentFrame = frameIndex;
 		ringHead = 0;
@@ -317,10 +308,6 @@ public unsafe class VulkanPipelineSystem : IDisposable
 		ringHead = aligned + (ulong)data.Length;
 		return (uint)aligned;
 	}
-
-	// ------------------------------------------------------------------
-	// White placeholder texture (all of set 1 until real textures exist)
-	// ------------------------------------------------------------------
 
 	bool CreateWhiteTexture() {
 		Vk vk = core.Vk;
@@ -461,10 +448,6 @@ public unsafe class VulkanPipelineSystem : IDisposable
 		return true;
 	}
 
-	// ------------------------------------------------------------------
-	// set 1 (material textures) cache
-	// ------------------------------------------------------------------
-
 	/// <summary>
 	/// The six (view, sampler) pairs a draw samples from. Descriptor sets are immutable once
 	/// written, so one set is cached per distinct combination - materials reuse the same handful.
@@ -575,10 +558,6 @@ public unsafe class VulkanPipelineSystem : IDisposable
 		foreach (TextureSetKey key in doomed)
 			textureSets.Remove(key);
 	}
-
-	// ------------------------------------------------------------------
-	// Pipeline cache
-	// ------------------------------------------------------------------
 
 	public Pipeline GetPipeline(in VulkanPipelineKey key) {
 		if (haveLastPipeline && key.Equals(lastKey))

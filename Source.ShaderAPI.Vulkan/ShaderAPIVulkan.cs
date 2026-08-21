@@ -19,10 +19,8 @@ using VkBuffer = Silk.NET.Vulkan.Buffer;
 namespace Source.ShaderAPI.Vulkan;
 
 /// <summary>
-/// Vulkan IShaderAPI/IShaderDevice. Phases 3+4 of VULKAN_TODO.md: real pipelines resolved from
-/// shadow-state snapshots, real VkBuffer meshes, dynamic-offset uniform ring, depth buffer.
-/// Textures are still a 1x1 white placeholder (set 1) - geometry renders flat-colored until the
-/// texture phase lands.
+/// Vulkan implementation of IShaderAPI/IShaderDevice. Pipelines are resolved from shadow-state
+/// snapshots; see VULKAN_TODO.md for what is and isn't implemented.
 /// </summary>
 public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 {
@@ -51,17 +49,12 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	internal GraphicsDriver Driver = GraphicsDriver.Vulkan13;
 	ShaderDeviceInfo PresentParameters;
 
-	// Distinctive default so a running Vulkan backend is unmistakable on screen
 	float clearR = 0.10f, clearG = 0.20f, clearB = 0.40f;
 
 	ILauncherManager LauncherManager => services.GetRequiredService<ILauncherManager>();
 
 	internal VulkanCore? Core => core;
 	internal VulkanMemoryAllocator? Allocator => allocator;
-
-	// ------------------------------------------------------------------
-	// Boot / device
-	// ------------------------------------------------------------------
 
 	public void PreInit(IShaderUtil shaderUtil, IServiceProvider services) {
 		this.services = services;
@@ -147,8 +140,7 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		return true;
 	}
 
-	// Release/ReacquireResources are the engine's lightweight "free device-reset-sensitive
-	// resources" pair - they must NOT tear down the device.
+	// These free device-reset-sensitive resources; they must not tear down the device.
 	public void ReleaseResources() { }
 	public void ReacquireResources() { }
 
@@ -215,10 +207,6 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	public int GetModeCount(int adapter) => LauncherManager.GetDisplayModeCount(adapter);
 	public void GetModeInfo(int adapter, int mode, out ShaderDisplayMode info) => LauncherManager.GetDisplayMode(adapter, mode, out info);
 
-	// ------------------------------------------------------------------
-	// Retired buffer queue (GL orphaning replacement)
-	// ------------------------------------------------------------------
-
 	readonly List<(VulkanBufferResource Buffer, int FramesLeft)> retiredBuffers = [];
 
 	internal void RetireBuffer(VulkanBufferResource buffer) =>
@@ -237,10 +225,6 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		}
 	}
 
-	// ------------------------------------------------------------------
-	// Frame lifecycle
-	// ------------------------------------------------------------------
-
 	public void BeginFrame() { }
 	public void EndFrame() { }
 
@@ -253,14 +237,24 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		if (frameLoop.NeedsRecreate)
 			return false; // handled at Present
 
-		// Pixels queued by texture loads must reach the GPU before anything samples them, and
-		// copies cannot be recorded inside the frame's dynamic rendering pass.
+		// Copies can't be recorded inside a rendering pass.
 		textureManager?.Flush();
 
-		if (!frameLoop.BeginFrame(clearR, clearG, clearB))
+		if (!frameLoop.BeginFrame())
 			return false;
 		OnFrameBegun();
 		return true;
+	}
+
+	/// <summary>Frame started and a rendering pass open on the current render target.</summary>
+	bool EnsureRendering() {
+		if (!EnsureFrameStarted())
+			return false;
+		if (frameLoop!.RenderingActive && !renderTargetDirty)
+			return true;
+
+		OpenRenderPass();
+		return frameLoop.RenderingActive;
 	}
 
 	void OnFrameBegun() {
@@ -274,6 +268,8 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		boundPipeline = default;
 		boundTextureSet = default;
 		pushFlagsDirty = true;
+		backbufferNeedsClear = true;
+		renderTargetDirty = true;
 	}
 
 	public void Present() {
@@ -282,9 +278,11 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		if (frameLoop == null || swapchain == null)
 			return;
 
-		// A frame with no draws (boot, loading) still presents the clear colour.
-		if (!frameLoop.FrameActive && frameLoop.BeginFrame(clearR, clearG, clearB))
+		if (!frameLoop.FrameActive && frameLoop.BeginFrame())
 			OnFrameBegun();
+
+		SetRenderTargetEx(0);
+		EnsureRendering();
 
 		frameLoop.EndFrameAndPresent();
 
@@ -298,10 +296,6 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		MeshMgr.DiscardVertexBuffers();
 	}
 
-	// ------------------------------------------------------------------
-	// Clears
-	// ------------------------------------------------------------------
-
 	public void ClearColor3ub(byte r, byte g, byte b) => ClearColor4ub(r, g, b, 255);
 	public void ClearColor4ub(byte r, byte g, byte b, byte a) {
 		clearR = r / 255.0f;
@@ -314,11 +308,10 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 			return;
 
 		FlushBufferedPrimitives();
-		if (!EnsureFrameStarted())
+		if (!EnsureRendering())
 			return;
 
-		// Mirror the GL semantics: -1/-1 (or a match with the viewport) clears everything,
-		// otherwise the clear is scissored to the viewport.
+		// -1/-1 clears everything; anything else is scissored to the viewport.
 		Rect2D rect = default;
 		if (renderTargetWidth != -1 || renderTargetHeight != -1) {
 			rect = new Rect2D(
@@ -334,10 +327,6 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	}
 	public ImageFormat GetBackBufferFormat() => ImageFormat.RGBA8888;
 
-	// ------------------------------------------------------------------
-	// Snapshots
-	// ------------------------------------------------------------------
-
 	public IShaderShadow NewShaderShadow(ReadOnlySpan<char> materialName) => new ShadowStateVulkan(this, materialName);
 	public bool IsTranslucent(IShaderShadow renderState) => ((ShadowStateVulkan)renderState).State.Blending;
 	public bool IsAlphaTested(IShaderShadow renderState) => ((ShadowStateVulkan)renderState).Pixel.IsAlphaTesting != 0;
@@ -349,14 +338,12 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		currentShadow = shadow;
 		currentBoardState = shadow.State;
 
-		// Each snapshot re-declares which sampler unit feeds which binding as it binds its
-		// textures; start from nothing so a previous material's routing cannot leak in.
+		// Each snapshot re-declares its own routing; don't let the last material's leak in.
 		Array.Fill(samplerForBinding, -1);
 		lastTextureSetValid = false;
 	}
 
 	public void InitRenderState() {
-		// Board-state defaults (what a GL context effectively starts as + shadow SetDefaultState).
 		currentBoardState = default;
 		currentBoardState.DepthFunc = ShaderDepthFunc.NearerOrEqual;
 		currentBoardState.ColorWrite = true;
@@ -383,10 +370,6 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		return true;
 	}
 
-	// ------------------------------------------------------------------
-	// Uniform blocks (CPU side of the ring)
-	// ------------------------------------------------------------------
-
 	static readonly int BlockCount = (int)VulkanPipelineSystem.UniformBlock.Count;
 	readonly byte[][] uniformBlocks = CreateUniformBlocks();
 	readonly bool[] uniformDirty = new bool[BlockCount];
@@ -398,7 +381,6 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		for (int i = 0; i < blocks.Length; i++)
 			blocks[i] = new byte[VulkanPipelineSystem.BlockSizes[i]];
 
-		// Bones start as identity, like the GL backend's bone UBO.
 		Span<Matrix4x4> bones = MemoryMarshal.Cast<byte, Matrix4x4>(blocks[(int)VulkanPipelineSystem.UniformBlock.Bones].AsSpan());
 		for (int i = 0; i < bones.Length; i++)
 			bones[i] = Matrix4x4.Identity;
@@ -410,17 +392,12 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	Span<T> Block<T>(VulkanPipelineSystem.UniformBlock block) where T : unmanaged =>
 		MemoryMarshal.Cast<byte, T>(uniformBlocks[(int)block].AsSpan());
 
-	// ------------------------------------------------------------------
-	// Matrices
-	// ------------------------------------------------------------------
-
 	MaterialMatrixMode currentMatrixMode;
 	readonly Matrix4x4[] Matrices = [Matrix4x4.Identity, Matrix4x4.Identity, Matrix4x4.Identity];
 
 	public void MatrixMode(MaterialMatrixMode mode) => currentMatrixMode = mode;
 
-	// Like the GL backend, loading a matrix does NOT flush buffered primitives - the UBO contents
-	// are only read at draw time, and SyncMatrices before each lock keeps batches coherent.
+	// Deliberately does not flush buffered primitives, matching the GL backend.
 	public void LoadMatrix(in Matrix4x4 matrix) {
 		Matrices[(int)currentMatrixMode] = matrix;
 		UploadMatrices();
@@ -442,11 +419,8 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	}
 
 	/// <summary>
-	/// GL clip space has z in [-1,1], Vulkan [0,1]. The engine's matrices are GL-flavoured, and
-	/// the upload convention (matching GL) is transpose-then-upload, after which the GLSL-side
-	/// math matrix M satisfies M[row][col] == Matrix4x4.M(row+1)(col+1). The clip z row is
-	/// therefore fields M31..M34 and the w row M41..M44; remap z' = 0.5*(z + w) there.
-	/// Y stays untouched - the negative-height viewport handles it.
+	/// Remaps GL clip space (z in [-1,1]) to Vulkan's [0,1]. Matrices are transposed on upload,
+	/// so the clip z row is M31..M34 and w is M41..M44. Y is handled by the negative viewport.
 	/// </summary>
 	static Matrix4x4 FixupProjection(in Matrix4x4 p) {
 		Matrix4x4 m = p;
@@ -458,17 +432,13 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	}
 
 	void UploadMatrices() {
-		// GL parity: matrices are transposed on their way into the UBO (see ShaderAPIGl46.LoadMatrix).
+		// Transposed on upload, as in ShaderAPIGl46.LoadMatrix.
 		Span<Matrix4x4> block = Block<Matrix4x4>(VulkanPipelineSystem.UniformBlock.Matrices);
 		block[(int)MaterialMatrixMode.View] = Matrix4x4.Transpose(Matrices[(int)MaterialMatrixMode.View]);
 		block[(int)MaterialMatrixMode.Projection] = Matrix4x4.Transpose(FixupProjection(in Matrices[(int)MaterialMatrixMode.Projection]));
 		block[(int)MaterialMatrixMode.Model] = Matrix4x4.Transpose(Matrices[(int)MaterialMatrixMode.Model]);
 		MarkDirty(VulkanPipelineSystem.UniformBlock.Matrices);
 	}
-
-	// ------------------------------------------------------------------
-	// Bones
-	// ------------------------------------------------------------------
 
 	int numBones;
 
@@ -492,10 +462,6 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		MarkDirty(VulkanPipelineSystem.UniformBlock.Bones);
 	}
 
-	// ------------------------------------------------------------------
-	// Shader constants
-	// ------------------------------------------------------------------
-
 	void SetShaderConstantInternal(VulkanPipelineSystem.UniformBlock block, int var, Span<float> vec) {
 		Span<float> dst = Block<float>(block);
 		int start = var * 4;
@@ -516,19 +482,12 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	public void SetPixelShaderConstant(int var, Span<float> vec) =>
 		SetShaderConstantInternal(VulkanPipelineSystem.UniformBlock.PsConstants, var, vec);
 
-	// ------------------------------------------------------------------
-	// Push constants ("flags")
-	// ------------------------------------------------------------------
-
 	int pushFlags;
 	bool pushFlagsDirty = true;
 	const int UniformFlags = 0;
 	const int UniformTextureBase = 0x1000;
 
-	/// <summary>
-	/// set-1 binding for each texture name, matching the layout(binding=) declarations in the
-	/// *_vk13 fragment shaders (documented in common_vk13.glsl).
-	/// </summary>
+	/// <summary>set-1 binding for a texture name, matching the *_vk13 shaders.</summary>
 	static int TextureBindingFor(ReadOnlySpan<char> name) {
 		if (name.SequenceEqual("basetexture")) return 0;
 		if (name.SequenceEqual("envmap")) return 1;
@@ -549,9 +508,8 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		if (name.SequenceEqual("flags"))
 			return UniformFlags;
 
-		// GL answers "which texture unit is this sampler on"; the vk13 shaders have fixed
-		// bindings instead, so the same call is used in reverse - the shader tells us which unit
-		// it put a given texture on, and we route that unit to the binding the shader samples.
+		// The vk13 shaders have fixed bindings, so this runs in reverse of GL: the shader tells
+		// us which unit it put a texture on, and we route that unit to the binding it samples.
 		int binding = TextureBindingFor(name);
 		return binding >= 0 ? UniformTextureBase + binding : -1;
 	}
@@ -587,26 +545,18 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		}
 	}
 
-	// ------------------------------------------------------------------
-	// Shader binding
-	// ------------------------------------------------------------------
-
 	VertexShaderHandle activeVertexShader = VertexShaderHandle.INVALID;
 	PixelShaderHandle activePixelShader = PixelShaderHandle.INVALID;
 
 	public void BindVertexShader(in VertexShaderHandle vertexShader) => activeVertexShader = vertexShader;
 	public void BindPixelShader(in PixelShaderHandle pixelShader) => activePixelShader = pixelShader;
-	public void SetVertexShaderIndex(int index) { } // combos not implemented (Phase 5)
+	public void SetVertexShaderIndex(int index) { } // combos not implemented
 	public void SetPixelShaderIndex(int index) { }
 	public int GetDynamicComboScale(ShaderType type, ReadOnlySpan<char> name) => 1;
 	public nint GetCurrentProgram() => 0;
 	public void SetVertexShaderStateAmbientLightCube() { }
 	public void CommitVertexShaderLighting() { }
 	public void InvalidateDelayedShaderConstants() { }
-
-	// ------------------------------------------------------------------
-	// Draw path
-	// ------------------------------------------------------------------
 
 	MeshVulkan? RenderMesh;
 	IMaterialInternal? Material;
@@ -655,7 +605,7 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	}
 
 	unsafe bool PrepareDraw(VertexFormat format, MaterialPrimitiveType topology) {
-		if (!EnsureFrameStarted())
+		if (!EnsureRendering())
 			return false;
 
 		if (!activeVertexShader.IsValid() || activeVertexShader.Handle == 0 ||
@@ -667,23 +617,21 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 			return false;
 		}
 
-		// A texture uploaded after this frame opened (procedural/dynamic content) still has its
-		// copy sitting unsubmitted; get it onto the GPU before a draw samples it.
+		// A texture uploaded mid-frame still has its copy unsubmitted.
 		if (textureManager!.HasPendingWork)
 			textureManager.Flush();
 
 		Vk vk = core!.Vk;
 		CommandBuffer cmd = frameLoop!.Cmd;
 
-		// Pipeline
 		VulkanPipelineKey key = new() {
 			State = currentBoardState,
 			VertexShader = activeVertexShader.Handle,
 			PixelShader = activePixelShader.Handle,
 			Format = format,
 			Topology = topology,
-			ColorFormat = swapchain!.ImageFormat,
-			DepthFormat = VulkanFrameLoop.DepthFormat
+			ColorFormat = currentColorFormat,
+			DepthFormat = currentDepthFormat
 		};
 		Pipeline pipeline = pipelines!.GetPipeline(in key);
 		if (pipeline.Handle == 0)
@@ -693,10 +641,8 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 			boundPipeline = pipeline;
 		}
 
-		// Shared uniform blocks come from the active snapshot
 		UpdateSharedBlocksFromShadow();
 
-		// Upload dirty blocks into the ring, rebind descriptor sets when offsets moved
 		bool offsetsChanged = false;
 		for (int i = 0; i < BlockCount; i++) {
 			if (!uniformDirty[i])
@@ -715,7 +661,6 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 			boundTextureSet = textureSet;
 		}
 
-		// Push constants
 		if (pushFlagsDirty) {
 			int flags = pushFlags;
 			vk.CmdPushConstants(cmd, pipelines.PipelineLayout, ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit, 0, sizeof(int), &flags);
@@ -782,15 +727,20 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	}
 
 	unsafe void ApplyViewportAndScissor(Vk vk, CommandBuffer cmd) {
-		swapchainExtent(out uint maxWidth, out uint maxHeight);
+		CurrentTargetSize(out int maxWidth, out int maxHeight);
 
 		int x = currentViewport.TopLeftX, y = currentViewport.TopLeftY;
 		int width = currentViewport.Width, height = currentViewport.Height;
 		if (width <= 0 || height <= 0) {
 			x = y = 0;
-			width = (int)maxWidth;
-			height = (int)maxHeight;
+			width = maxWidth;
+			height = maxHeight;
 		}
+		// A viewport larger than the attachment is invalid in Vulkan; GL silently clamped.
+		width = Math.Min(width, Math.Max(maxWidth - x, 0));
+		height = Math.Min(height, Math.Max(maxHeight - y, 0));
+		if (width <= 0 || height <= 0)
+			return;
 
 		// Negative height = GL-style clip space (Y up), rectangle anchored at the top-left position.
 		Viewport viewport = new() {
@@ -807,9 +757,15 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		vk.CmdSetScissor(cmd, 0, 1, &scissor);
 	}
 
-	void swapchainExtent(out uint width, out uint height) {
-		width = swapchain?.Extent.Width ?? 0;
-		height = swapchain?.Extent.Height ?? 0;
+	/// <summary>Dimensions of whatever is currently being rendered into.</summary>
+	void CurrentTargetSize(out int width, out int height) {
+		if (usingTextureRenderTarget) {
+			width = viewportMaxWidth;
+			height = viewportMaxHeight;
+			return;
+		}
+		width = (int)(swapchain?.Extent.Width ?? 0);
+		height = (int)(swapchain?.Extent.Height ?? 0);
 	}
 
 	internal unsafe bool BindMeshBuffers(VertexBufferVulkan vertexBuffer, IndexBufferVulkan indexBuffer) {
@@ -840,10 +796,6 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	public void ShadeMode(ShadeMode mode) { }
 	public bool InEditorMode() => false;
 
-	// ------------------------------------------------------------------
-	// Meshes
-	// ------------------------------------------------------------------
-
 	public IMesh CreateStaticMesh(VertexFormat format, ReadOnlySpan<char> textureGroup, IMaterial? material) =>
 		MeshMgr.CreateStaticMesh(format, textureGroup, material);
 	public void DestroyStaticMesh(IMesh mesh) => MeshMgr.DestroyStaticMesh(mesh);
@@ -854,10 +806,6 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	public int GetCurrentDynamicVBSize() => (1024 + 512) * 1024;
 	public int GetMaxVerticesToRender(IMaterial material) => MeshMgr.GetMaxVerticesToRender(material);
 	public int GetMaxIndicesToRender() => MeshMgr.GetMaxIndicesToRender();
-
-	// ------------------------------------------------------------------
-	// Textures
-	// ------------------------------------------------------------------
 
 	readonly Dictionary<ShaderAPITextureHandle_t, VulkanTexture> textures = [];
 	ShaderAPITextureHandle_t nextTextureHandle = 1;
@@ -1127,31 +1075,153 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	public void BindStandardTexture(Sampler sampler, StandardTextureId id) => ShaderUtil.BindStandardTexture(sampler, id);
 	public void SetStandardTextureHandle(StandardTextureId id, int handle) { }
 
-	// ------------------------------------------------------------------
-	// Render targets
-	// ------------------------------------------------------------------
-
-	bool warnedRenderTargets;
+	VulkanTexture? renderTargetColor;   // null = the swapchain backbuffer
+	VulkanTexture? renderTargetDepth;   // null = the frame loop's shared depth buffer
+	bool renderTargetNoDepth;
+	bool renderTargetDirty = true;
+	bool backbufferNeedsClear = true;
+	bool usingTextureRenderTarget;
+	int viewportMaxWidth, viewportMaxHeight;
 
 	public bool DoRenderTargetsNeedSeparateDepthBuffer() => false;
 	public void EnableLinearColorSpaceFrameBuffer(bool v) { }
+
 	public void SetRenderTargetEx(int rt,
 		ShaderAPITextureHandle_t colorTextureHandle = (ShaderAPITextureHandle_t)ShaderRenderTarget.Backbuffer,
 		ShaderAPITextureHandle_t depthTextureHandle = (ShaderAPITextureHandle_t)ShaderRenderTarget.Depthbuffer) {
-		if (colorTextureHandle >= 0 || depthTextureHandle >= 0) {
-			if (!warnedRenderTargets) {
-				warnedRenderTargets = true;
-				Warning("Vulkan: texture render targets not implemented yet; drawing to the backbuffer instead\n");
-			}
+		// Only one colour attachment is wired up; MRT would need the extra views threaded through
+		// the pipeline key as well.
+		if (rt != 0)
+			return;
+
+		FlushBufferedPrimitives();
+
+		VulkanTexture? color = colorTextureHandle >= 0 && textures.TryGetValue(colorTextureHandle, out VulkanTexture? c) ? c : null;
+		VulkanTexture? depth = depthTextureHandle >= 0 && textures.TryGetValue(depthTextureHandle, out VulkanTexture? d) ? d : null;
+		bool noDepth = depthTextureHandle == (ShaderAPITextureHandle_t)ShaderRenderTarget.None;
+
+		if (color == renderTargetColor && depth == renderTargetDepth && noDepth == renderTargetNoDepth)
+			return;
+
+		renderTargetColor = color;
+		renderTargetDepth = depth;
+		renderTargetNoDepth = noDepth;
+		renderTargetDirty = true;
+
+		usingTextureRenderTarget = color != null;
+		if (color != null) {
+			viewportMaxWidth = color.Width;
+			viewportMaxHeight = color.Height;
 		}
 	}
+
+	/// <summary>
+	/// Closes any open pass, moves the attachments into the layouts they need, and opens a pass on
+	/// the current target. A texture that was being rendered into goes back to shader-read so it
+	/// can be sampled by whatever comes next.
+	/// </summary>
+	unsafe void OpenRenderPass() {
+		frameLoop!.EndRendering();
+		renderTargetDirty = false;
+
+		CommandBuffer cmd = frameLoop.Cmd;
+
+		foreach (VulkanTexture texture in colorAttachmentsInUse) {
+			if (texture != renderTargetColor)
+				TransitionTexture(cmd, texture, ImageLayout.ShaderReadOnlyOptimal);
+		}
+		colorAttachmentsInUse.RemoveAll(t => t != renderTargetColor);
+
+		VulkanFrameLoop.RenderPassTarget target;
+		bool clear = false;
+		bool discard = false;
+
+		if (renderTargetColor == null) {
+			target = frameLoop.SwapchainTarget;
+			clear = backbufferNeedsClear;
+			backbufferNeedsClear = false;
+		}
+		else {
+			ImageView colorView = textureManager!.GetView(renderTargetColor);
+			if (colorView.Handle == 0)
+				return;
+
+			discard = !renderTargetColor.RenderedTo;
+			TransitionTexture(cmd, renderTargetColor, ImageLayout.ColorAttachmentOptimal);
+			renderTargetColor.RenderedTo = true;
+			if (!colorAttachmentsInUse.Contains(renderTargetColor))
+				colorAttachmentsInUse.Add(renderTargetColor);
+
+			target = new VulkanFrameLoop.RenderPassTarget {
+				ColorView = colorView,
+				ColorFormat = renderTargetColor.VkFormat,
+				Extent = new Extent2D((uint)renderTargetColor.Width, (uint)renderTargetColor.Height)
+			};
+		}
+
+		if (renderTargetNoDepth) {
+			target.DepthView = default;
+			target.DepthFormat = Format.Undefined;
+		}
+		else if (renderTargetDepth != null) {
+			ImageView depthView = textureManager!.GetView(renderTargetDepth);
+			TransitionTexture(cmd, renderTargetDepth, ImageLayout.DepthAttachmentOptimal);
+			target.DepthView = depthView;
+			target.DepthFormat = renderTargetDepth.VkFormat;
+			target.Extent = MinExtent(target.Extent, new Extent2D((uint)renderTargetDepth.Width, (uint)renderTargetDepth.Height));
+		}
+		else if (renderTargetColor != null) {
+			// Sharing the backbuffer's depth buffer: the pass can only cover what both can hold.
+			target.DepthView = frameLoop.SharedDepthView;
+			target.DepthFormat = VulkanFrameLoop.DepthFormat;
+			target.Extent = MinExtent(target.Extent, frameLoop.SharedDepthExtent);
+		}
+
+		currentColorFormat = target.ColorFormat;
+		currentDepthFormat = target.DepthView.Handle != 0 ? target.DepthFormat : Format.Undefined;
+
+		frameLoop.BeginRendering(in target, clear, clearR, clearG, clearB, discard);
+	}
+
+	static Extent2D MinExtent(Extent2D a, Extent2D b) =>
+		new(Math.Min(a.Width, b.Width), Math.Min(a.Height, b.Height));
+
+	readonly List<VulkanTexture> colorAttachmentsInUse = [];
+	Format currentColorFormat;
+	Format currentDepthFormat;
+
+	void TransitionTexture(CommandBuffer cmd, VulkanTexture texture, ImageLayout newLayout) {
+		int copy = texture.CurrentCopy;
+		ImageLayout old = texture.Layouts[copy];
+		if (old == newLayout)
+			return;
+
+		bool depth = newLayout == ImageLayout.DepthAttachmentOptimal || texture.IsDepth;
+		ImageAspectFlags aspect = depth ? ImageAspectFlags.DepthBit : ImageAspectFlags.ColorBit;
+
+		(PipelineStageFlags2 srcStage, AccessFlags2 srcAccess) = LayoutAccess(old, texture.IsDepth);
+		(PipelineStageFlags2 dstStage, AccessFlags2 dstAccess) = LayoutAccess(newLayout, texture.IsDepth);
+
+		frameLoop!.TransitionImage(cmd, texture.Images[copy], aspect, old, newLayout,
+			srcStage, srcAccess, dstStage, dstAccess, texture.MipCount, texture.FaceCount);
+
+		texture.Layouts[copy] = newLayout;
+	}
+
+	static (PipelineStageFlags2, AccessFlags2) LayoutAccess(ImageLayout layout, bool isDepth) => layout switch {
+		ImageLayout.Undefined => (PipelineStageFlags2.TopOfPipeBit, AccessFlags2.None),
+		ImageLayout.TransferDstOptimal => (PipelineStageFlags2.TransferBit, AccessFlags2.TransferWriteBit),
+		ImageLayout.ColorAttachmentOptimal => (PipelineStageFlags2.ColorAttachmentOutputBit, AccessFlags2.ColorAttachmentWriteBit),
+		ImageLayout.DepthAttachmentOptimal => (
+			PipelineStageFlags2.EarlyFragmentTestsBit | PipelineStageFlags2.LateFragmentTestsBit,
+			AccessFlags2.DepthStencilAttachmentReadBit | AccessFlags2.DepthStencilAttachmentWriteBit),
+		ImageLayout.ShaderReadOnlyOptimal => (PipelineStageFlags2.FragmentShaderBit, AccessFlags2.ShaderReadBit),
+		_ => (PipelineStageFlags2.AllCommandsBit, AccessFlags2.None)
+	};
+
 	public bool SupportsShadowDepthTextures() => true;
 	public ImageFormat GetShadowDepthTextureFormat() => ImageFormat.NV_DST24;
 	public ImageFormat GetNullTextureFormat() => ImageFormat.NV_NULL;
-
-	// ------------------------------------------------------------------
-	// Viewports / scissor / stencil
-	// ------------------------------------------------------------------
 
 	ShaderViewport currentViewport;
 	public void SetViewports(ReadOnlySpan<ShaderViewport> viewports) {
@@ -1173,10 +1243,6 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	public void SetStencilTestMask(uint msk) { }
 	public void SetStencilWriteMask(uint msk) { }
 
-	// ------------------------------------------------------------------
-	// Lighting / fog
-	// ------------------------------------------------------------------
-
 	public void SetAmbientLightCube(ReadOnlySpan<Vector4> cube) { }
 	public void SetLightingOrigin(Vector3 lightingOrigin) { }
 	public void SetAmbientLight(float r, float g, float b) { }
@@ -1190,10 +1256,6 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 
 	public float LinearToGamma_HardwareSpecific(float fLookupResult) => fLookupResult;
 	public void SetLinearToGammaConversionTextures(int linearToGammaTableTextureHandle, int linearToGammaIdentityTableTextureHandle) { }
-
-	// ------------------------------------------------------------------
-	// IDebugTextureInfo
-	// ------------------------------------------------------------------
 
 	public void EnableDebugTextureList(bool enable) { }
 	public void EnableGetAllTextures(bool enable) { }

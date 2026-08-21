@@ -5,9 +5,9 @@ using VkBuffer = Silk.NET.Vulkan.Buffer;
 namespace Source.ShaderAPI.Vulkan;
 
 /// <summary>
-/// Chunked VkDeviceMemory allocator (Phase 4 of VULKAN_TODO.md): 64MB chunks per memory type,
-/// first-fit free list with merge-on-free, whole-chunk persistent mapping for host-visible types.
-/// Exists so buffers/images never call vkAllocateMemory individually (maxMemoryAllocationCount).
+/// Chunked VkDeviceMemory allocator: 64MB chunks per memory type, first-fit free list with
+/// merge-on-free, whole-chunk persistent mapping for host-visible types. Exists so buffers and
+/// images never call vkAllocateMemory individually (maxMemoryAllocationCount).
 /// </summary>
 public unsafe class VulkanMemoryAllocator(VulkanCore core) : IDisposable
 {
@@ -155,8 +155,8 @@ public unsafe class VulkanMemoryAllocator(VulkanCore core) : IDisposable
 }
 
 /// <summary>
-/// A VkBuffer bound to suballocated memory. Bring-up policy: everything is host-visible+coherent
-/// (Unlock is a plain memcpy through <see cref="Mapped"/>); device-local + staging comes later.
+/// A VkBuffer bound to suballocated memory. Everything is host-visible+coherent for now, so
+/// Unlock is a plain memcpy through <see cref="Mapped"/>; device-local + staging comes later.
 /// </summary>
 public unsafe class VulkanBufferResource : IDisposable
 {

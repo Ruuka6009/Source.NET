@@ -11,9 +11,8 @@ using System.Numerics;
 namespace Source.ShaderAPI.Vulkan;
 
 /// <summary>
-/// Vulkan shader system. The material-facing logic mirrors the Gl46 ShaderSystem; the actual
-/// shader loading (SPIR-V from disk, per Phase 5 of VULKAN_TODO.md) is stubbed to INVALID so
-/// std shaders can run their snapshot/draw passes against the stub states without a real pipeline.
+/// Vulkan shader system. The material-facing logic mirrors the Gl46 ShaderSystem; shaders are
+/// loaded as SPIR-V from disk and cached as VkShaderModules.
 /// </summary>
 public interface IShaderSystemInternalVulkan : IShaderInit, IShaderSystem;
 

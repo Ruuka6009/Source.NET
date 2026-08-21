@@ -6,9 +6,8 @@ namespace Source.ShaderAPI.Vulkan;
 
 /// <summary>
 /// Frames-in-flight, command pools/buffers, the depth buffer and the
-/// acquire -> record -> submit -> present cycle. Phase 3/4 shape: BeginFrame opens a dynamic
-/// rendering pass (color+depth cleared) that draws are recorded into; EndFrameAndPresent closes,
-/// submits and presents it. A frame with no draws still clears (the Phase 2 boot behaviour).
+/// acquire -> record -> submit -> present cycle. Rendering passes are opened per render target by
+/// the shader API, not here, so it can switch targets within a frame.
 /// </summary>
 public unsafe class VulkanFrameLoop : IDisposable
 {
@@ -163,10 +162,12 @@ public unsafe class VulkanFrameLoop : IDisposable
 	}
 
 	/// <summary>
-	/// Acquires the next image and opens the frame's rendering pass, clearing color+depth.
+	/// Acquires the next swapchain image and opens the frame's command buffer. No rendering pass
+	/// is started here - the shader API opens one per render target through
+	/// <see cref="BeginRendering"/>, so it can switch targets mid-frame.
 	/// Returns false when the swapchain needs recreation (NeedsRecreate) or on failure.
 	/// </summary>
-	public bool BeginFrame(float r, float g, float b) {
+	public bool BeginFrame() {
 		if (FrameActive)
 			return true;
 
@@ -195,50 +196,127 @@ public unsafe class VulkanFrameLoop : IDisposable
 		CommandBufferBeginInfo beginInfo = new() { SType = StructureType.CommandBufferBeginInfo };
 		vk.BeginCommandBuffer(cmd, &beginInfo);
 
-		TransitionImage(vk, cmd, swapchain.Images[imageIndex], ImageAspectFlags.ColorBit,
+		TransitionImage(cmd, swapchain.Images[imageIndex], ImageAspectFlags.ColorBit,
 			ImageLayout.Undefined, ImageLayout.ColorAttachmentOptimal,
 			PipelineStageFlags2.TopOfPipeBit, 0,
 			PipelineStageFlags2.ColorAttachmentOutputBit, AccessFlags2.ColorAttachmentWriteBit);
 
-		TransitionImage(vk, cmd, depthImage, ImageAspectFlags.DepthBit,
+		TransitionImage(cmd, depthImage, ImageAspectFlags.DepthBit,
 			ImageLayout.Undefined, ImageLayout.DepthAttachmentOptimal,
 			PipelineStageFlags2.TopOfPipeBit, 0,
 			PipelineStageFlags2.EarlyFragmentTestsBit | PipelineStageFlags2.LateFragmentTestsBit,
 			AccessFlags2.DepthStencilAttachmentReadBit | AccessFlags2.DepthStencilAttachmentWriteBit);
 
+		FrameActive = true;
+		return true;
+	}
+
+	/// <summary>The attachments one rendering pass draws into.</summary>
+	public struct RenderPassTarget
+	{
+		public ImageView ColorView;
+		public Format ColorFormat;
+		/// <summary>Zero when the pass has no depth attachment.</summary>
+		public ImageView DepthView;
+		public Format DepthFormat;
+		public Extent2D Extent;
+	}
+
+	/// <summary>True while a rendering pass is open (draws are only legal here).</summary>
+	public bool RenderingActive { get; private set; }
+
+	public RenderPassTarget SwapchainTarget => new() {
+		ColorView = swapchain.ImageViews[currentImageIndex],
+		ColorFormat = swapchain.ImageFormat,
+		DepthView = depthImageView,
+		DepthFormat = DepthFormat,
+		Extent = swapchain.Extent
+	};
+
+	/// <summary>Shared depth buffer, used by any target that does not bring its own.</summary>
+	public ImageView SharedDepthView => depthImageView;
+	public Extent2D SharedDepthExtent => swapchain.Extent;
+
+	/// <summary>
+	/// Opens a rendering pass on the given attachments. <paramref name="clearColor"/> is used for
+	/// the frame's first pass on the backbuffer; everything else loads what is already there
+	/// (targets whose contents are undefined pass <paramref name="discardExisting"/>).
+	/// </summary>
+	public void BeginRendering(in RenderPassTarget target, bool clearColor, float r, float g, float b, bool discardExisting) {
+		if (!FrameActive || RenderingActive)
+			return;
+
+		AttachmentLoadOp colorLoad = clearColor ? AttachmentLoadOp.Clear
+			: discardExisting ? AttachmentLoadOp.DontCare
+			: AttachmentLoadOp.Load;
+
 		RenderingAttachmentInfo colorAttachment = new() {
 			SType = StructureType.RenderingAttachmentInfo,
-			ImageView = swapchain.ImageViews[imageIndex],
+			ImageView = target.ColorView,
 			ImageLayout = ImageLayout.ColorAttachmentOptimal,
-			LoadOp = AttachmentLoadOp.Clear,
+			LoadOp = colorLoad,
 			StoreOp = AttachmentStoreOp.Store,
 			ClearValue = new ClearValue(new ClearColorValue(r, g, b, 1.0f))
 		};
 		RenderingAttachmentInfo depthAttachment = new() {
 			SType = StructureType.RenderingAttachmentInfo,
-			ImageView = depthImageView,
+			ImageView = target.DepthView,
 			ImageLayout = ImageLayout.DepthAttachmentOptimal,
-			LoadOp = AttachmentLoadOp.Clear,
-			StoreOp = AttachmentStoreOp.DontCare,
+			// Depth is never preserved across passes (the engine clears it when it matters), and
+			// StoreOp.DontCare lets tilers drop it entirely.
+			LoadOp = clearColor ? AttachmentLoadOp.Clear : AttachmentLoadOp.Load,
+			StoreOp = AttachmentStoreOp.Store,
 			ClearValue = new ClearValue(depthStencil: new ClearDepthStencilValue(1.0f, 0))
 		};
+
 		RenderingInfo renderingInfo = new() {
 			SType = StructureType.RenderingInfo,
-			RenderArea = new Rect2D(new Offset2D(0, 0), swapchain.Extent),
+			RenderArea = new Rect2D(new Offset2D(0, 0), target.Extent),
 			LayerCount = 1,
 			ColorAttachmentCount = 1,
 			PColorAttachments = &colorAttachment,
-			PDepthAttachment = &depthAttachment
+			PDepthAttachment = target.DepthView.Handle != 0 ? &depthAttachment : null
 		};
-		vk.CmdBeginRendering(cmd, &renderingInfo);
-
-		FrameActive = true;
-		return true;
+		core.Vk.CmdBeginRendering(commandBuffers[currentFrame], &renderingInfo);
+		RenderingActive = true;
 	}
 
-	/// <summary>Mid-frame clear (the engine's explicit ClearBuffers) inside the open rendering pass.</summary>
+	public void EndRendering() {
+		if (!RenderingActive)
+			return;
+		core.Vk.CmdEndRendering(commandBuffers[currentFrame]);
+		RenderingActive = false;
+	}
+
+	/// <summary>Layout transition on an arbitrary image, for render-target switches.</summary>
+	public void TransitionImage(CommandBuffer cmd, Image image, ImageAspectFlags aspect,
+		ImageLayout oldLayout, ImageLayout newLayout,
+		PipelineStageFlags2 srcStage, AccessFlags2 srcAccess,
+		PipelineStageFlags2 dstStage, AccessFlags2 dstAccess, int mips = 1, int layers = 1) {
+		ImageMemoryBarrier2 barrier = new() {
+			SType = StructureType.ImageMemoryBarrier2,
+			SrcStageMask = srcStage,
+			SrcAccessMask = srcAccess,
+			DstStageMask = dstStage,
+			DstAccessMask = dstAccess,
+			OldLayout = oldLayout,
+			NewLayout = newLayout,
+			SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+			Image = image,
+			SubresourceRange = new ImageSubresourceRange(aspect, 0, (uint)mips, 0, (uint)layers)
+		};
+		DependencyInfo dependencyInfo = new() {
+			SType = StructureType.DependencyInfo,
+			ImageMemoryBarrierCount = 1,
+			PImageMemoryBarriers = &barrier
+		};
+		core.Vk.CmdPipelineBarrier2(cmd, &dependencyInfo);
+	}
+
+	/// <summary>Mid-pass clear (the engine's explicit ClearBuffers) inside the open rendering pass.</summary>
 	public void ClearAttachments(bool clearColor, bool clearDepth, float r, float g, float b, Rect2D rect) {
-		if (!FrameActive)
+		if (!RenderingActive)
 			return;
 
 		Vk vk = core.Vk;
@@ -276,9 +354,9 @@ public unsafe class VulkanFrameLoop : IDisposable
 		CommandBuffer cmd = commandBuffers[currentFrame];
 		uint imageIndex = currentImageIndex;
 
-		vk.CmdEndRendering(cmd);
+		EndRendering();
 
-		TransitionImage(vk, cmd, swapchain.Images[imageIndex], ImageAspectFlags.ColorBit,
+		TransitionImage(cmd, swapchain.Images[imageIndex], ImageAspectFlags.ColorBit,
 			ImageLayout.ColorAttachmentOptimal, ImageLayout.PresentSrcKhr,
 			PipelineStageFlags2.ColorAttachmentOutputBit, AccessFlags2.ColorAttachmentWriteBit,
 			PipelineStageFlags2.BottomOfPipeBit, 0);
@@ -328,31 +406,6 @@ public unsafe class VulkanFrameLoop : IDisposable
 
 		currentFrame = (currentFrame + 1) % FramesInFlight;
 		FrameActive = false;
-	}
-
-	static void TransitionImage(Vk vk, CommandBuffer cmd, Image image, ImageAspectFlags aspect,
-		ImageLayout oldLayout, ImageLayout newLayout,
-		PipelineStageFlags2 srcStage, AccessFlags2 srcAccess,
-		PipelineStageFlags2 dstStage, AccessFlags2 dstAccess) {
-		ImageMemoryBarrier2 barrier = new() {
-			SType = StructureType.ImageMemoryBarrier2,
-			SrcStageMask = srcStage,
-			SrcAccessMask = srcAccess,
-			DstStageMask = dstStage,
-			DstAccessMask = dstAccess,
-			OldLayout = oldLayout,
-			NewLayout = newLayout,
-			SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-			DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-			Image = image,
-			SubresourceRange = new ImageSubresourceRange(aspect, 0, 1, 0, 1)
-		};
-		DependencyInfo dependencyInfo = new() {
-			SType = StructureType.DependencyInfo,
-			ImageMemoryBarrierCount = 1,
-			PImageMemoryBarriers = &barrier
-		};
-		vk.CmdPipelineBarrier2(cmd, &dependencyInfo);
 	}
 
 	public void Dispose() {

@@ -1,5 +1,7 @@
 #version 460
 
+
+
 layout(location = 0) in vec3 v_Position;
 layout(location = 1) in vec3 v_Normal;
 layout(location = 10) in vec2 v_TexCoord;
@@ -20,6 +22,7 @@ const int VERTEX_SHADER_BASE_TEXCOORD_TRANSFORM = 48; // SHADER_SPECIFIC_CONST_0
 out vec2 vs_TexCoord;
 out vec3 vs_WorldNormal;
 out vec3 vs_WorldVertToEye;
+out vec3 vs_WorldPos;
 
 void main()
 {
@@ -32,4 +35,5 @@ void main()
 
     vs_WorldNormal = mat3(modelMatrix) * v_Normal;
     vs_WorldVertToEye = vs_const[VERTEX_SHADER_CAMERA_POS].xyz - worldPos.xyz;
+    vs_WorldPos = worldPos.xyz;
 }

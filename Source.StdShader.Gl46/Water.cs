@@ -1,4 +1,4 @@
-using Source.Common.MaterialSystem;
+﻿using Source.Common.MaterialSystem;
 using Source.Common.ShaderAPI;
 using Source.Common.ShaderLib;
 
@@ -50,6 +50,10 @@ public class Water : BaseVSShader
 	public static readonly ShaderParam FOGENABLE = new("$fogenable", ShaderParamType.Bool, "1", "");
 	public static readonly ShaderParam REFLECTAMOUNT = new("$reflectamount", ShaderParamType.Float, "0.8", "how strongly the surface reflects");
 	public static readonly ShaderParam REFRACTAMOUNT = new("$refractamount", ShaderParamType.Float, "0.2", "ripple strength");
+	public static readonly ShaderParam WAVESCALE = new("$wavescale", ShaderParamType.Float, "0.06", "world units to wave space");
+	public static readonly ShaderParam WAVESTRENGTH = new("$wavestrength", ShaderParamType.Float, "0.055", "how far the ripples tilt the surface");
+	public static readonly ShaderParam SUNDIR = new("$sundir", ShaderParamType.Vec3, "[0.4 0.3 0.55]", "direction the sun glitter comes from");
+	public static readonly ShaderParam SUNAMOUNT = new("$sunamount", ShaderParamType.Float, "1.6", "sun glitter intensity");
 	public static readonly ShaderParam ABOVEWATER = new("$abovewater", ShaderParamType.Bool, "1", "");
 	public static readonly ShaderParam BOTTOMMATERIAL = new("$bottommaterial", ShaderParamType.String, "", "");
 	public static readonly ShaderParam SCALE = new("$scale", ShaderParamType.Vec2, "[1 1]", "");
@@ -75,10 +79,25 @@ public class Water : BaseVSShader
 
 	public override string? GetFallbackShader(IMaterialVar[] vars) => null;
 
+	// The engine's SetFrameTime is a stub, so the animation keeps its own monotonic clock. Water
+	// ripples are ambient - they do not need to be in step with game time.
+	static readonly System.Diagnostics.Stopwatch waveClock = System.Diagnostics.Stopwatch.StartNew();
+	static float WaveTime => (float)waveClock.Elapsed.TotalSeconds;
+
 	protected override void OnInitShaderParams(IMaterialVar[] vars, ReadOnlySpan<char> materialName) {
 		// Water is its own lighting model; the world's fog would double up on $fogcolor.
 		SetFlags(vars, MaterialVarFlags.NoFog);
 		SetFlags(vars, MaterialVarFlags.Translucent);
+
+		// Anything still undefined after this gets zeroed by InitShaderParameters - it does not
+		// fall back to the declared default string. Zero wave strength is a mirror-flat surface
+		// and zero sun amount is no glitter, so the tuning values have to be set here.
+		if (!vars[WAVESCALE].IsDefined()) vars[WAVESCALE].SetFloatValue(0.048f);
+		if (!vars[WAVESTRENGTH].IsDefined()) vars[WAVESTRENGTH].SetFloatValue(0.095f);
+		if (!vars[SUNAMOUNT].IsDefined()) vars[SUNAMOUNT].SetFloatValue(1.1f);
+		if (!vars[SUNDIR].IsDefined()) vars[SUNDIR].SetVecValue(0.40f, 0.30f, 0.55f);
+		if (!vars[REFLECTAMOUNT].IsDefined()) vars[REFLECTAMOUNT].SetFloatValue(0.8f);
+		if (!vars[FOGCOLOR].IsDefined()) vars[FOGCOLOR].SetVecValue(0.11f, 0.26f, 0.29f);
 	}
 
 	protected override void OnInitShaderInstance(IMaterialVar[] vars, ReadOnlySpan<char> materialName) {
@@ -109,19 +128,27 @@ public class Water : BaseVSShader
 
 			SetVertexShaderTextureTransform(48, (int)ShaderMaterialVars.BaseTextureTransform);
 
-			// ps_const[0] = fog colour + reflect amount, ps_const[1].x = ripple strength
+			bool hasEnvmap = vars[ENVMAP].IsTexture();
+
 			Span<float> fog = stackalloc float[4];
 			vars[FOGCOLOR].GetVecValue(fog[..3]);
-
-			// With no cubemap bound the backends substitute a 1x1 white texture, and blending
-			// toward that turns the whole surface white. Reflect nothing instead, so the water
-			// shows its own colour.
-			fog[3] = vars[ENVMAP].IsTexture() ? vars[REFLECTAMOUNT].GetFloatValue() : 0.0f;
+			// Reflection always contributes: a real cubemap when the material has one, the
+			// shader's procedural sky otherwise. Only the 1x1 white fallback is worth avoiding.
+			fog[3] = vars[REFLECTAMOUNT].GetFloatValue();
 			shaderAPI.SetPixelShaderConstant(0, fog);
 
-			// Ripple strength stays 0 while no normal map is loaded (see OnInitShaderInstance).
-			Span<float> ripple = [0, 0, 0, 0];
-			shaderAPI.SetPixelShaderConstant(1, ripple);
+			Span<float> wave = [
+				WaveTime,
+				vars[WAVESCALE].GetFloatValue(),
+				vars[WAVESTRENGTH].GetFloatValue(),
+				hasEnvmap ? 1.0f : 0.0f
+			];
+			shaderAPI.SetPixelShaderConstant(1, wave);
+
+			Span<float> sun = stackalloc float[4];
+			vars[SUNDIR].GetVecValue(sun[..3]);
+			sun[3] = vars[SUNAMOUNT].GetFloatValue();
+			shaderAPI.SetPixelShaderConstant(2, sun);
 		}
 		Draw();
 	}

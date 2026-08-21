@@ -28,6 +28,8 @@ public unsafe class VulkanCore : IDisposable
 	public uint GraphicsQueueFamily { get; private set; }
 	public uint PresentQueueFamily { get; private set; }
 	public SurfaceKHR Surface { get; private set; }
+	/// <summary>Human-readable "(device name), Vulkan (api version)" - set once a device is picked.</summary>
+	public string DeviceDescription { get; private set; } = "Vulkan (no device)";
 	public KhrSurface KhrSurface { get; private set; } = null!;
 	public KhrSwapchain KhrSwapchain { get; private set; } = null!;
 
@@ -213,7 +215,9 @@ public unsafe class VulkanCore : IDisposable
 		PresentQueueFamily = bestPresent;
 
 		Vk.GetPhysicalDeviceProperties(PhysicalDevice, out PhysicalDeviceProperties chosen);
-		Msg($"Vulkan: using {SilkMarshal.PtrToString((nint)chosen.DeviceName)}\n");
+		uint api = chosen.ApiVersion;
+		DeviceDescription = $"{SilkMarshal.PtrToString((nint)chosen.DeviceName)}, Vulkan {api >> 22}.{(api >> 12) & 0x3FF}.{api & 0xFFF}";
+		Msg($"Vulkan: using {DeviceDescription}\n");
 		return true;
 	}
 

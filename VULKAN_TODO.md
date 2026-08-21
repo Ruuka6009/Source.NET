@@ -46,7 +46,11 @@ wired into the launcher and not yet run** — runtime-verify each box before tic
 - [x] Swapchain + recreation — `VulkanSwapchain.cs`; sRGB BGRA8 preferred, mailbox > immediate when vsync off, `OldSwapchain` chained on recreate.
 - [x] Frames in flight (2), command pools/buffers, semaphores + fences — `VulkanFrameLoop.cs`, sync2 (`QueueSubmit2`/`CmdPipelineBarrier2`), dynamic rendering clear pass, out-of-date -> `NeedsRecreate`.
 - [x] `VulkanGraphicsContext : IGraphicsContext` — MakeCurrent no-op, SwapBuffers no-op (present at submit), SetSwapInterval flags a swapchain recreate.
-- [ ] **Goal: clear the screen to a colour.** Remaining: a `ShaderDeviceVulkan` shim implementing enough of `IShaderAPI`/`IShaderDevice` to boot with `-vulkan`, wire `Program.cs` selection, then actually run it.
+- [x] **Goal: clear the screen to a colour.** `ShaderAPIVulkan` shim implements `IShaderAPI`/`IShaderDevice`/`IDebugTextureInfo`
+      (all draw/texture/state calls swallowed; `ShadowStateVulkan`, `ShaderSystemVulkan`, `HardwareConfigVulkan`,
+      `DummyMeshVulkan` back the material system). `Program.cs` selects it on `-vulkan`. Verified 2026-08-21 on an
+      RTX 3060 (Vulkan 1.4): boots to the running engine loop, presents the clear colour every frame, no exceptions.
+      Validation layers were unavailable on the test machine (no Vulkan SDK installed) — install it before Phase 3.
 
 ## Phase 3 — the actual hard part: state machine -> pipelines
 

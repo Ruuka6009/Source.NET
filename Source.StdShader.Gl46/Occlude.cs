@@ -1,12 +1,12 @@
-using Source.Common.MaterialSystem;
+﻿using Source.Common.MaterialSystem;
 using Source.Common.ShaderLib;
 
 namespace Source.StdShader.Gl46;
 
-public class Occlusion : BaseVSShader
+public class Occlude : BaseVSShader
 {
 
-	public static string HelpString = "Help for Occlusion";
+	public static string HelpString = "Help for Occlude";
 	public static int Flags = 0;
 	public static List<ShaderParam> ShaderParams = [];
 	public static ShaderParam[] ShaderParamOverrides = new ShaderParam[(int)ShaderMaterialVars.Count];

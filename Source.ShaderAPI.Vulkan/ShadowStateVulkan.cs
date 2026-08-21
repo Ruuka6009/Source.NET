@@ -94,16 +94,42 @@ public class ShadowStateVulkan : IShaderShadow
 	public void VertexShaderVertexFormat(VertexFormat format, int texCoordCount, Span<int> texCoordDimensions, int userDataSize)
 		=> vertexFormat = format;
 
+	string? vertexShaderFile;
+	string? pixelShaderFile;
+
+	/// <summary>Static combo bits for this snapshot, in the layout common_vk13.glsl branches on.</summary>
+	internal int StaticComboBits { get; private set; }
+
 	public void SetVertexShader(ReadOnlySpan<char> fileName, int staticIndex = 0) {
-		VertexShader = shaderAPI.ShaderLoader.LoadVertexShader($"{fileName}_{GetDriver().Extension(ShaderType.Vertex)}");
+		vertexShaderFile = $"{fileName}_{GetDriver().Extension(ShaderType.Vertex)}";
+		VertexShader = shaderAPI.ShaderLoader.LoadVertexShader(vertexShaderFile);
+		StaticComboBits |= UnpackStatic(vertexShaderFile, staticIndex);
 	}
 
 	public void SetPixelShader(ReadOnlySpan<char> fileName, int staticIndex = 0) {
-		PixelShader = shaderAPI.ShaderLoader.LoadPixelShader($"{fileName}_{GetDriver().Extension(ShaderType.Pixel)}");
+		pixelShaderFile = $"{fileName}_{GetDriver().Extension(ShaderType.Pixel)}";
+		PixelShader = shaderAPI.ShaderLoader.LoadPixelShader(pixelShaderFile);
+		StaticComboBits |= UnpackStatic(pixelShaderFile, staticIndex);
 	}
 
-	// Combos are ignored for now; needs the vertexlitgeneric rework.
-	public int GetStaticComboScale(ShaderType type, ReadOnlySpan<char> fileName, ReadOnlySpan<char> name) => 1;
+	int UnpackStatic(string file, int staticIndex) =>
+		VulkanShaderCombos.Unpack(shaderAPI.Combos.Get(file).Static, staticIndex);
+
+	public int GetStaticComboScale(ShaderType type, ReadOnlySpan<char> fileName, ReadOnlySpan<char> name) {
+		string file = $"{fileName}_{GetDriver().Extension(type)}";
+		return VulkanShaderCombos.Scale(shaderAPI.Combos.Get(file).Static, name);
+	}
+
+	/// <summary>Dynamic combo scale for whichever shader of this type the snapshot selected.</summary>
+	internal int GetDynamicComboScale(ShaderType type, ReadOnlySpan<char> name) {
+		string? file = type == ShaderType.Vertex ? vertexShaderFile : pixelShaderFile;
+		return file == null ? 0 : VulkanShaderCombos.Scale(shaderAPI.Combos.Get(file).Dynamic, name);
+	}
+
+	internal int UnpackDynamic(ShaderType type, int dynamicIndex) {
+		string? file = type == ShaderType.Vertex ? vertexShaderFile : pixelShaderFile;
+		return file == null ? 0 : VulkanShaderCombos.Unpack(shaderAPI.Combos.Get(file).Dynamic, dynamicIndex);
+	}
 
 	public void Activate() {
 		shaderAPI.SetCurrentShadow(this);

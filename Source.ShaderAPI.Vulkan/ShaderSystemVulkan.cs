@@ -278,6 +278,9 @@ public class ShaderSystemVulkan(IServiceProvider services, IFileSystem fileSyste
 	readonly Dictionary<ulong, PixelShaderHandle> pshs = [];
 	readonly HashSet<ulong> warnedShaders = [];
 
+	VulkanShaderCombos? combos;
+	public VulkanShaderCombos Combos => combos ??= new VulkanShaderCombos(fileSystem);
+
 	static ulong ComboSymbol(ReadOnlySpan<char> name, ReadOnlySpan<char> defines) {
 		ulong symbol = name.Hash();
 		if (!defines.IsEmpty)

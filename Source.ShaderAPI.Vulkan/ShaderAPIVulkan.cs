@@ -267,7 +267,7 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		descriptorsBound = false;
 		boundPipeline = default;
 		boundTextureSet = default;
-		pushFlagsDirty = true;
+		pushConstantsDirty = true;
 		backbufferNeedsClear = true;
 		renderTargetDirty = true;
 	}
@@ -341,6 +341,7 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		// Each snapshot re-declares its own routing; don't let the last material's leak in.
 		Array.Fill(samplerForBinding, -1);
 		lastTextureSetValid = false;
+		pushConstantsDirty = true;
 	}
 
 	public void InitRenderState() {
@@ -483,7 +484,7 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		SetShaderConstantInternal(VulkanPipelineSystem.UniformBlock.PsConstants, var, vec);
 
 	int pushFlags;
-	bool pushFlagsDirty = true;
+	bool pushConstantsDirty = true;
 	const int UniformFlags = 0;
 	const int UniformTextureBase = 0x1000;
 
@@ -518,7 +519,7 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		if (uniform == UniformFlags) {
 			if (pushFlags != integer) {
 				pushFlags = integer;
-				pushFlagsDirty = true;
+				pushConstantsDirty = true;
 			}
 			return;
 		}
@@ -550,9 +551,27 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 
 	public void BindVertexShader(in VertexShaderHandle vertexShader) => activeVertexShader = vertexShader;
 	public void BindPixelShader(in PixelShaderHandle pixelShader) => activePixelShader = pixelShader;
-	public void SetVertexShaderIndex(int index) { } // combos not implemented
-	public void SetPixelShaderIndex(int index) { }
-	public int GetDynamicComboScale(ShaderType type, ReadOnlySpan<char> name) => 1;
+
+	int dynamicComboBits;
+
+	public void SetVertexShaderIndex(int index) => SetDynamicComboIndex(ShaderType.Vertex, index);
+	public void SetPixelShaderIndex(int index) => SetDynamicComboIndex(ShaderType.Pixel, index);
+
+	void SetDynamicComboIndex(ShaderType type, int index) {
+		if (currentShadow == null)
+			return;
+
+		int bits = currentShadow.UnpackDynamic(type, index);
+		if (bits != dynamicComboBits) {
+			dynamicComboBits = bits;
+			pushConstantsDirty = true;
+		}
+	}
+
+	public int GetDynamicComboScale(ShaderType type, ReadOnlySpan<char> name) =>
+		currentShadow?.GetDynamicComboScale(type, name) ?? 0;
+
+	internal VulkanShaderCombos Combos => ((ShaderSystemVulkan)ShaderManager).Combos;
 	public nint GetCurrentProgram() => 0;
 	public void SetVertexShaderStateAmbientLightCube() { }
 	public void CommitVertexShaderLighting() { }
@@ -661,10 +680,10 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 			boundTextureSet = textureSet;
 		}
 
-		if (pushFlagsDirty) {
-			int flags = pushFlags;
-			vk.CmdPushConstants(cmd, pipelines.PipelineLayout, ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit, 0, sizeof(int), &flags);
-			pushFlagsDirty = false;
+		if (pushConstantsDirty) {
+			int* push = stackalloc int[2] { pushFlags, (currentShadow?.StaticComboBits ?? 0) | dynamicComboBits };
+			vk.CmdPushConstants(cmd, pipelines.PipelineLayout, ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit, 0, sizeof(int) * 2, push);
+			pushConstantsDirty = false;
 		}
 
 		ApplyViewportAndScissor(vk, cmd);
@@ -694,6 +713,11 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 
 			ShaderAPITextureHandle_t handle = boundTextures[sampler];
 			if (!textures.TryGetValue(handle, out VulkanTexture? texture) || !texture.HasContent)
+				continue;
+
+			// Binding 1 is declared samplerCube; a 2D view there is a type mismatch, so leave the
+			// white cube in place rather than handing the shader something it cannot sample.
+			if ((binding == 1) != texture.IsCubeMap)
 				continue;
 
 			ImageView view = textureManager!.GetView(texture);

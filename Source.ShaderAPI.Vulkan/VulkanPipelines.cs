@@ -116,14 +116,20 @@ public unsafe class VulkanPipelineSystem : IDisposable
 	VulkanBufferResource? zeroVertexBuffer;
 	public VkBuffer ZeroVertexBuffer => zeroVertexBuffer!.Handle;
 
-	Image whiteImage;
-	ImageView whiteImageView;
+	Image whiteImage, whiteCubeImage;
+	ImageView whiteImageView, whiteCubeImageView;
 	VkSampler whiteSampler;
-	VulkanMemoryAllocator.Allocation whiteImageAlloc;
+	VulkanMemoryAllocator.Allocation whiteImageAlloc, whiteCubeImageAlloc;
 
 	/// <summary>1x1 opaque white - the fallback for any set-1 slot a material does not bind.</summary>
 	public ImageView WhiteImageView => whiteImageView;
 	public VkSampler WhiteSampler => whiteSampler;
+
+	/// <summary>
+	/// Binding 1 is sampled as a samplerCube (envmap), so its fallback has to be a cube view -
+	/// a 2D view in a cube descriptor slot is a type mismatch, not just a wrong colour.
+	/// </summary>
+	public ImageView WhiteViewFor(int binding) => binding == 1 ? whiteCubeImageView : whiteImageView;
 
 	ulong uniformAlignment = 256;
 	ulong ringHead;
@@ -183,11 +189,11 @@ public unsafe class VulkanPipelineSystem : IDisposable
 		if (vk.CreateDescriptorSetLayout(core.Device, &set1Info, null, out set1Layout) != Result.Success)
 			return Fail("set 1 layout");
 
-		// --- pipeline layout: set0 + set1 + int flags push constant ---
+		// --- pipeline layout: set0 + set1 + (flags, combos) push constants ---
 		PushConstantRange pushRange = new() {
 			StageFlags = ShaderStageFlags.VertexBit | ShaderStageFlags.FragmentBit,
 			Offset = 0,
-			Size = sizeof(int)
+			Size = sizeof(int) * 2
 		};
 		DescriptorSetLayout* setLayouts = stackalloc DescriptorSetLayout[2] { set0Layout, set1Layout };
 		PipelineLayoutCreateInfo layoutInfo = new() {
@@ -312,29 +318,98 @@ public unsafe class VulkanPipelineSystem : IDisposable
 	bool CreateWhiteTexture() {
 		Vk vk = core.Vk;
 
+		if (!CreateWhiteImage(1, false, out whiteImage, out whiteImageAlloc) ||
+			!CreateWhiteImage(6, true, out whiteCubeImage, out whiteCubeImageAlloc))
+			return false;
+
+		if (!UploadWhite())
+			return false;
+
+		if (!CreateWhiteView(whiteImage, ImageViewType.Type2D, 1, out whiteImageView) ||
+			!CreateWhiteView(whiteCubeImage, ImageViewType.TypeCube, 6, out whiteCubeImageView))
+			return false;
+
+		SamplerCreateInfo samplerInfo = new() {
+			SType = StructureType.SamplerCreateInfo,
+			MagFilter = Filter.Linear,
+			MinFilter = Filter.Linear,
+			MipmapMode = SamplerMipmapMode.Linear,
+			AddressModeU = SamplerAddressMode.Repeat,
+			AddressModeV = SamplerAddressMode.Repeat,
+			AddressModeW = SamplerAddressMode.Repeat,
+			MaxLod = Vk.LodClampNone
+		};
+		if (vk.CreateSampler(core.Device, &samplerInfo, null, out whiteSampler) != Result.Success)
+			return Fail("white sampler");
+
+		if (!AllocateSet(set1Layout, out DescriptorSet whiteSet))
+			return Fail("white descriptor set");
+		Set1WhiteSet = whiteSet;
+
+		DescriptorImageInfo* images = stackalloc DescriptorImageInfo[TextureBindingCount];
+		WriteDescriptorSet* writes = stackalloc WriteDescriptorSet[TextureBindingCount];
+		for (int i = 0; i < TextureBindingCount; i++) {
+			images[i] = new DescriptorImageInfo(whiteSampler, WhiteViewFor(i), ImageLayout.ShaderReadOnlyOptimal);
+			writes[i] = new WriteDescriptorSet {
+				SType = StructureType.WriteDescriptorSet,
+				DstSet = Set1WhiteSet,
+				DstBinding = (uint)i,
+				DescriptorCount = 1,
+				DescriptorType = DescriptorType.CombinedImageSampler,
+				PImageInfo = &images[i]
+			};
+		}
+		vk.UpdateDescriptorSets(core.Device, TextureBindingCount, writes, 0, null);
+		return true;
+	}
+
+	bool CreateWhiteImage(uint layers, bool cube, out Image image, out VulkanMemoryAllocator.Allocation alloc) {
+		Vk vk = core.Vk;
+		alloc = default;
+
 		ImageCreateInfo imageInfo = new() {
 			SType = StructureType.ImageCreateInfo,
+			Flags = cube ? ImageCreateFlags.CreateCubeCompatibleBit : 0,
 			ImageType = ImageType.Type2D,
 			Format = VkFormat.R8G8B8A8Unorm,
 			Extent = new Extent3D(1, 1, 1),
 			MipLevels = 1,
-			ArrayLayers = 1,
+			ArrayLayers = layers,
 			Samples = SampleCountFlags.Count1Bit,
 			Tiling = ImageTiling.Optimal,
 			Usage = ImageUsageFlags.TransferDstBit | ImageUsageFlags.SampledBit,
 			SharingMode = SharingMode.Exclusive,
 			InitialLayout = ImageLayout.Undefined
 		};
-		if (vk.CreateImage(core.Device, &imageInfo, null, out whiteImage) != Result.Success)
+		if (vk.CreateImage(core.Device, &imageInfo, null, out image) != Result.Success)
 			return Fail("white image");
 
-		vk.GetImageMemoryRequirements(core.Device, whiteImage, out MemoryRequirements reqs);
-		whiteImageAlloc = allocator.Allocate(in reqs, MemoryPropertyFlags.DeviceLocalBit);
-		vk.BindImageMemory(core.Device, whiteImage, whiteImageAlloc.Memory, whiteImageAlloc.Offset);
+		vk.GetImageMemoryRequirements(core.Device, image, out MemoryRequirements reqs);
+		alloc = allocator.Allocate(in reqs, MemoryPropertyFlags.DeviceLocalBit);
+		vk.BindImageMemory(core.Device, image, alloc.Memory, alloc.Offset);
+		return true;
+	}
 
-		// Staging + one-shot upload
-		using VulkanBufferResource staging = VulkanBufferResource.Create(core, allocator, 4, BufferUsageFlags.TransferSrcBit);
-		new Span<byte>(staging.Mapped, 4).Fill(0xFF);
+	bool CreateWhiteView(Image image, ImageViewType type, uint layers, out ImageView view) {
+		ImageViewCreateInfo viewInfo = new() {
+			SType = StructureType.ImageViewCreateInfo,
+			Image = image,
+			ViewType = type,
+			Format = VkFormat.R8G8B8A8Unorm,
+			SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, layers)
+		};
+		if (core.Vk.CreateImageView(core.Device, &viewInfo, null, out view) != Result.Success)
+			return Fail("white image view");
+		return true;
+	}
+
+	bool UploadWhite() {
+		Vk vk = core.Vk;
+
+		// One texel per layer: a 6-layer cube copy reads six of them out of the same buffer.
+		const int whiteTexels = 6 * 4;
+		using VulkanBufferResource staging = VulkanBufferResource.Create(core, allocator, whiteTexels, BufferUsageFlags.TransferSrcBit);
+		new Span<byte>(staging.Mapped, whiteTexels).Fill(0xFF);
 
 		CommandPoolCreateInfo poolInfo = new() {
 			SType = StructureType.CommandPoolCreateInfo,
@@ -359,37 +434,8 @@ public unsafe class VulkanPipelineSystem : IDisposable
 			};
 			vk.BeginCommandBuffer(cmd, &begin);
 
-			ImageMemoryBarrier2 toTransfer = new() {
-				SType = StructureType.ImageMemoryBarrier2,
-				SrcStageMask = PipelineStageFlags2.TopOfPipeBit,
-				DstStageMask = PipelineStageFlags2.TransferBit,
-				DstAccessMask = AccessFlags2.TransferWriteBit,
-				OldLayout = ImageLayout.Undefined,
-				NewLayout = ImageLayout.TransferDstOptimal,
-				SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
-				DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
-				Image = whiteImage,
-				SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1)
-			};
-			DependencyInfo dep = new() { SType = StructureType.DependencyInfo, ImageMemoryBarrierCount = 1, PImageMemoryBarriers = &toTransfer };
-			vk.CmdPipelineBarrier2(cmd, &dep);
-
-			BufferImageCopy region = new() {
-				ImageSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
-				ImageExtent = new Extent3D(1, 1, 1)
-			};
-			vk.CmdCopyBufferToImage(cmd, staging.Handle, whiteImage, ImageLayout.TransferDstOptimal, 1, &region);
-
-			ImageMemoryBarrier2 toSampled = toTransfer with {
-				SrcStageMask = PipelineStageFlags2.TransferBit,
-				SrcAccessMask = AccessFlags2.TransferWriteBit,
-				DstStageMask = PipelineStageFlags2.FragmentShaderBit,
-				DstAccessMask = AccessFlags2.ShaderReadBit,
-				OldLayout = ImageLayout.TransferDstOptimal,
-				NewLayout = ImageLayout.ShaderReadOnlyOptimal
-			};
-			DependencyInfo dep2 = new() { SType = StructureType.DependencyInfo, ImageMemoryBarrierCount = 1, PImageMemoryBarriers = &toSampled };
-			vk.CmdPipelineBarrier2(cmd, &dep2);
+			WhiteFill(cmd, staging.Handle, whiteImage, 1);
+			WhiteFill(cmd, staging.Handle, whiteCubeImage, 6);
 
 			vk.EndCommandBuffer(cmd);
 
@@ -404,48 +450,43 @@ public unsafe class VulkanPipelineSystem : IDisposable
 		finally {
 			vk.DestroyCommandPool(core.Device, pool, null);
 		}
-
-		ImageViewCreateInfo viewInfo = new() {
-			SType = StructureType.ImageViewCreateInfo,
-			Image = whiteImage,
-			ViewType = ImageViewType.Type2D,
-			Format = VkFormat.R8G8B8A8Unorm,
-			SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1)
-		};
-		if (vk.CreateImageView(core.Device, &viewInfo, null, out whiteImageView) != Result.Success)
-			return Fail("white image view");
-
-		SamplerCreateInfo samplerInfo = new() {
-			SType = StructureType.SamplerCreateInfo,
-			MagFilter = Filter.Linear,
-			MinFilter = Filter.Linear,
-			MipmapMode = SamplerMipmapMode.Linear,
-			AddressModeU = SamplerAddressMode.Repeat,
-			AddressModeV = SamplerAddressMode.Repeat,
-			AddressModeW = SamplerAddressMode.Repeat,
-			MaxLod = Vk.LodClampNone
-		};
-		if (vk.CreateSampler(core.Device, &samplerInfo, null, out whiteSampler) != Result.Success)
-			return Fail("white sampler");
-
-		if (!AllocateSet(set1Layout, out DescriptorSet whiteSet))
-			return Fail("white descriptor set");
-		Set1WhiteSet = whiteSet;
-
-		DescriptorImageInfo imageDescriptor = new(whiteSampler, whiteImageView, ImageLayout.ShaderReadOnlyOptimal);
-		WriteDescriptorSet* writes = stackalloc WriteDescriptorSet[TextureBindingCount];
-		for (int i = 0; i < TextureBindingCount; i++) {
-			writes[i] = new WriteDescriptorSet {
-				SType = StructureType.WriteDescriptorSet,
-				DstSet = Set1WhiteSet,
-				DstBinding = (uint)i,
-				DescriptorCount = 1,
-				DescriptorType = DescriptorType.CombinedImageSampler,
-				PImageInfo = &imageDescriptor
-			};
-		}
-		vk.UpdateDescriptorSets(core.Device, TextureBindingCount, writes, 0, null);
 		return true;
+	}
+
+	void WhiteFill(CommandBuffer cmd, VkBuffer staging, Image image, uint layers) {
+		Vk vk = core.Vk;
+
+		ImageMemoryBarrier2 toTransfer = new() {
+			SType = StructureType.ImageMemoryBarrier2,
+			SrcStageMask = PipelineStageFlags2.TopOfPipeBit,
+			DstStageMask = PipelineStageFlags2.TransferBit,
+			DstAccessMask = AccessFlags2.TransferWriteBit,
+			OldLayout = ImageLayout.Undefined,
+			NewLayout = ImageLayout.TransferDstOptimal,
+			SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
+			DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
+			Image = image,
+			SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, layers)
+		};
+		DependencyInfo dep = new() { SType = StructureType.DependencyInfo, ImageMemoryBarrierCount = 1, PImageMemoryBarriers = &toTransfer };
+		vk.CmdPipelineBarrier2(cmd, &dep);
+
+		BufferImageCopy region = new() {
+			ImageSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, layers),
+			ImageExtent = new Extent3D(1, 1, 1)
+		};
+		vk.CmdCopyBufferToImage(cmd, staging, image, ImageLayout.TransferDstOptimal, 1, &region);
+
+		ImageMemoryBarrier2 toSampled = toTransfer with {
+			SrcStageMask = PipelineStageFlags2.TransferBit,
+			SrcAccessMask = AccessFlags2.TransferWriteBit,
+			DstStageMask = PipelineStageFlags2.FragmentShaderBit,
+			DstAccessMask = AccessFlags2.ShaderReadBit,
+			OldLayout = ImageLayout.TransferDstOptimal,
+			NewLayout = ImageLayout.ShaderReadOnlyOptimal
+		};
+		DependencyInfo dep2 = new() { SType = StructureType.DependencyInfo, ImageMemoryBarrierCount = 1, PImageMemoryBarriers = &toSampled };
+		vk.CmdPipelineBarrier2(cmd, &dep2);
 	}
 
 	/// <summary>
@@ -516,7 +557,7 @@ public unsafe class VulkanPipelineSystem : IDisposable
 			(ulong view, ulong sampler) = key.Get(i);
 			images[i] = new DescriptorImageInfo(
 				new VkSampler(sampler == 0 ? whiteSampler.Handle : sampler),
-				new ImageView(view == 0 ? whiteImageView.Handle : view),
+				new ImageView(view == 0 ? WhiteViewFor(i).Handle : view),
 				ImageLayout.ShaderReadOnlyOptimal);
 			writes[i] = new WriteDescriptorSet {
 				SType = StructureType.WriteDescriptorSet,
@@ -680,7 +721,9 @@ public unsafe class VulkanPipelineSystem : IDisposable
 				SType = StructureType.PipelineRasterizationStateCreateInfo,
 				PolygonMode = polygonMode,
 				CullMode = state.CullEnable ? CullModeFlags.BackBit : CullModeFlags.None,
-				// GL backend runs glFrontFace(GL_CW); the negative-height viewport keeps winding GL-compatible.
+				// GL runs glFrontFace(GL_CW); the negative-height viewport keeps the signed area
+				// oriented as GL sees it, so CW matches. Note world geometry currently disappears
+				// with culling on while UI needs this setting - see VULKAN_TODO.md.
 				FrontFace = FrontFace.Clockwise,
 				LineWidth = 1.0f,
 				DepthBiasEnable = depthBias,
@@ -774,9 +817,14 @@ public unsafe class VulkanPipelineSystem : IDisposable
 
 		if (whiteSampler.Handle != 0) vk.DestroySampler(core.Device, whiteSampler, null);
 		if (whiteImageView.Handle != 0) vk.DestroyImageView(core.Device, whiteImageView, null);
+		if (whiteCubeImageView.Handle != 0) vk.DestroyImageView(core.Device, whiteCubeImageView, null);
 		if (whiteImage.Handle != 0) {
 			vk.DestroyImage(core.Device, whiteImage, null);
 			allocator.Free(in whiteImageAlloc);
+		}
+		if (whiteCubeImage.Handle != 0) {
+			vk.DestroyImage(core.Device, whiteCubeImage, null);
+			allocator.Free(in whiteCubeImageAlloc);
 		}
 
 		zeroVertexBuffer?.Dispose();

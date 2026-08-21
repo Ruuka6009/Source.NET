@@ -410,3 +410,6 @@ Source.Launcher/Properties/launchSettings.json
 
 # Generated SPIR-V (built by Game.Assets CompileVulkanShaders from the *_vk13 GLSL)
 Game.Assets/hl2/shaders/*.spv
+
+# Local working notes
+VULKAN_TODO.md

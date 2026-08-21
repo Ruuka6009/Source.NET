@@ -3,18 +3,18 @@ using Game.Shared;
 
 using Source;
 using Source.Common.GUI;
+using Source.Common.Formats.Keyvalues;
 using Source.Common.MaterialSystem;
 using Source.GUI.Controls;
 
 namespace Game.Client.HL2;
 
 /// <summary>
-/// Tints the screen while the player's eyes are under water, and runs a short drain-off when they
-/// surface.
+/// Underwater view: distorts the scene, tints it, and runs a short drain-off on surfacing.
 ///
-/// This is the overlay half of the underwater look. Warping the rendered scene the way Source does
-/// needs a copy of the backbuffer to sample from, and this port has no CopyRenderTargetToTexture,
-/// so the distortion is not possible yet - see VULKAN_TODO.md.
+/// The distortion copies the frame into _rt_FullFrameFB and redraws it through the ScreenWarp
+/// shader with rippled UVs. HUD elements painted after this one stay sharp, since the warp only
+/// covers what was already on screen when it ran.
 /// </summary>
 [DeclareHudElement(Name = "CHudUnderwater")]
 class HudUnderwater : EditableHudElement, IHudElement
@@ -72,18 +72,39 @@ class HudUnderwater : EditableHudElement, IHudElement
 	}
 
 	ITexture? frameCopy;
+	IMaterial? warpMaterial;
+
+	IMaterial GetWarpMaterial() {
+		if (warpMaterial != null)
+			return warpMaterial;
+
+		KeyValues vmt = new("ScreenWarp");
+		vmt.SetString("$basetexture", MaterialDefines.FULL_FRAME_FRAMEBUFFER);
+		warpMaterial = materials.CreateMaterial("__underwaterWarp", vmt);
+		return warpMaterial;
+	}
 
 	public override void Paint() {
 		GetSize(out int wide, out int tall);
 
 		if (submerged > 0.001f) {
-			// Grab the frame as it stands (world and viewmodel are already drawn, the rest of the
-			// HUD is not) into _rt_FullFrameFB. Nothing samples it yet - the distortion pass still
-			// needs its shader - but this is the path screen-space effects will use.
+			// Copy the frame as it stands - world and viewmodel are drawn, the rest of the HUD is
+			// not - then draw it straight back with its UVs rippled. Redrawing the copy is what
+			// bends the scene; the HUD elements after this one stay sharp because they paint on
+			// top afterwards.
 			frameCopy ??= materials.FindTexture(MaterialDefines.FULL_FRAME_FRAMEBUFFER, null, false);
 			if (frameCopy != null) {
 				using MatRenderContextPtr renderContext = new(materials);
 				renderContext.CopyRenderTargetToTexture(frameCopy);
+
+				int texWide = frameCopy.GetActualWidth();
+				int texTall = frameCopy.GetActualHeight();
+				if (texWide > 0 && texTall > 0) {
+					IMaterial warp = GetWarpMaterial();
+					warp.FindVar("$warpamount", out _)?.SetFloatValue(submerged);
+					renderUtils.DrawScreenSpaceRectangle(warp, 0, 0, wide, tall,
+						0, 0, texWide - 1, texTall - 1, texWide, texTall, null, 1, 1, 0);
+				}
 			}
 		}
 

@@ -56,6 +56,8 @@ public unsafe class VulkanFrameLoop : IDisposable
 
 	public CommandBuffer Cmd => commandBuffers[currentFrame];
 	public int FrameIndex => currentFrame;
+	/// <summary>Swapchain image being rendered into this frame.</summary>
+	public uint CurrentImageIndex => currentImageIndex;
 
 	public VulkanFrameLoop(VulkanCore core, VulkanSwapchain swapchain, VulkanMemoryAllocator allocator) {
 		this.core = core;

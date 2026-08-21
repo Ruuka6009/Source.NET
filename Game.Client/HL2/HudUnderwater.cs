@@ -3,6 +3,7 @@ using Game.Shared;
 
 using Source;
 using Source.Common.GUI;
+using Source.Common.MaterialSystem;
 using Source.GUI.Controls;
 
 namespace Game.Client.HL2;
@@ -70,8 +71,21 @@ class HudUnderwater : EditableHudElement, IHudElement
 			drain = Math.Max(0.0f, drain - dt);
 	}
 
+	ITexture? frameCopy;
+
 	public override void Paint() {
 		GetSize(out int wide, out int tall);
+
+		if (submerged > 0.001f) {
+			// Grab the frame as it stands (world and viewmodel are already drawn, the rest of the
+			// HUD is not) into _rt_FullFrameFB. Nothing samples it yet - the distortion pass still
+			// needs its shader - but this is the path screen-space effects will use.
+			frameCopy ??= materials.FindTexture(MaterialDefines.FULL_FRAME_FRAMEBUFFER, null, false);
+			if (frameCopy != null) {
+				using MatRenderContextPtr renderContext = new(materials);
+				renderContext.CopyRenderTargetToTexture(frameCopy);
+			}
+		}
 
 		if (submerged > 0.001f) {
 			// Deeper tint low on the screen, lighter toward the surface above, drawn as a few

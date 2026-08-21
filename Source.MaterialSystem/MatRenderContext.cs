@@ -1,4 +1,4 @@
-﻿using Source.Common.MaterialSystem;
+using Source.Common.MaterialSystem;
 using Source.Common.Mathematics;
 using Source.Common.ShaderAPI;
 using Source.Common.Utilities;
@@ -618,6 +618,14 @@ public class MatRenderContext : IMatRenderContextInternal
 	[MethodImpl(MethodImplOptions.AggressiveInlining)] public ShaderAPITextureHandle_t GetGreyTextureHandle() => materials.GetGreyTextureHandle();
 	[MethodImpl(MethodImplOptions.AggressiveInlining)] public ShaderAPITextureHandle_t GetGreyAlphaZeroTextureHandle() => materials.GetGreyAlphaZeroTextureHandle();
 	[MethodImpl(MethodImplOptions.AggressiveInlining)] public ShaderAPITextureHandle_t GetWhiteTextureHandle() => materials.GetWhiteTextureHandle();
+
+	public void CopyRenderTargetToTexture(ITexture texture) {
+		if (texture is not ITextureInternal internalTexture)
+			return;
+
+		shaderAPI.FlushBufferedPrimitives();
+		shaderAPI.CopyRenderTargetToTexture(internalTexture.GetTextureHandle(0));
+	}
 
 	public void BindStandardTexture(Sampler sampler, StandardTextureId id) {
 		switch (id) {

@@ -1,4 +1,4 @@
-﻿using Source.Common;
+using Source.Common;
 using Source.Common.Bitmap;
 using Source.Common.Formats.Keyvalues;
 using Source.Common.Launcher;
@@ -345,6 +345,7 @@ public class DummyMaterialSystem : IMaterialSystemStub, IShaderUtil, IMatRenderC
 	public void BindLightmap(Sampler sampler) { }
 	public void BindLightmapPage(int lightmapPageID) { }
 	public void BindStandardTexture(Sampler sampler, StandardTextureId id) { }
+	public void CopyRenderTargetToTexture(ITexture texture) { }
 	public bool CanUseEditorMaterials() => false;
 	public void ClearBuffers(bool clearColor, bool clearDepth, bool clearStencil = false) { }
 	public void ClearColor3ub(byte r, byte g, byte b) { }

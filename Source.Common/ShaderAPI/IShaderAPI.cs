@@ -80,6 +80,13 @@ public interface IShaderAPI : IShaderDynamicAPI
 	bool DoRenderTargetsNeedSeparateDepthBuffer();
 	void EnableLinearColorSpaceFrameBuffer(bool v);
 	void SetRenderTargetEx(int rt, ShaderAPITextureHandle_t colorTextureHandle = (ShaderAPITextureHandle_t)ShaderRenderTarget.Backbuffer, ShaderAPITextureHandle_t depthTextureHandle = (ShaderAPITextureHandle_t)ShaderRenderTarget.Depthbuffer);
+
+	/// <summary>
+	/// Copies what has been rendered so far into a texture, so a later pass can sample the frame
+	/// it is drawing over. This is what screen-space effects (refraction, underwater distortion)
+	/// are built on.
+	/// </summary>
+	void CopyRenderTargetToTexture(ShaderAPITextureHandle_t textureHandle);
 	void InvalidateDelayedShaderConstants();
 	void SetSkinningMatrices();
 	void ShadeMode(ShadeMode flat);

@@ -2068,6 +2068,25 @@ public class ShaderAPIGl46 : IShaderAPI, IShaderDevice, IDebugTextureInfo
 
 	public IShaderDevice GetShaderDevice() => this;
 
+	/// <summary>
+	/// Copies what has been rendered so far into a texture, so a later pass can sample the frame
+	/// it is drawing over (refraction, underwater distortion).
+	/// </summary>
+	public void CopyRenderTargetToTexture(ShaderAPITextureHandle_t textureHandle) {
+		if (IsDeactivated() || !TextureIsAllocated(textureHandle))
+			return;
+
+		FlushBufferedPrimitives();
+
+		InternalTextureInfo tex = GetTexture(textureHandle);
+		int width = Math.Min(tex.Width, Viewport.Width);
+		int height = Math.Min(tex.Height, Viewport.Height);
+		if (width <= 0 || height <= 0)
+			return;
+
+		glCopyTextureSubImage2D(GetGL46Texture(textureHandle), 0, 0, 0, Viewport.X, Viewport.Y, width, height);
+	}
+
 	public void SetRenderTargetEx(int renderTargetID, ShaderAPITextureHandle_t colorTextureHandle = -1, ShaderAPITextureHandle_t depthTextureHandle = -1) {
 		FlushBufferedPrimitives();
 

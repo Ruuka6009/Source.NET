@@ -356,6 +356,13 @@ public interface IMatRenderContext
 	void BindLightmapPage(int lightmapPageID);
 	void BindLightmap(Sampler sampler);
 	void BindStandardTexture(Sampler sampler, StandardTextureId id);
+
+	/// <summary>
+	/// Copies the current render target into a texture. Same name and semantics as Source's
+	/// IMatRenderContext::CopyRenderTargetToTexture, so legacy content that expects
+	/// _rt_FullFrameFB / _rt_WaterRefraction to be filled behaves the way it always did.
+	/// </summary>
+	void CopyRenderTargetToTexture(ITexture texture);
 	void BindLocalCubemap(ITexture tex);
 	ITexture? GetLocalCubemap();
 	void SetLightingOrigin(Vector3 lightingOrigin);
@@ -468,6 +475,7 @@ public readonly struct MatRenderContextPtr : IDisposable, IMatRenderContext
 	}
 
 	public void BindStandardTexture(Sampler sampler, StandardTextureId id) => ctx.BindStandardTexture(sampler, id);
+	public void CopyRenderTargetToTexture(ITexture texture) => ctx.CopyRenderTargetToTexture(texture);
 	public void BindLocalCubemap(ITexture texture) => ctx.BindLocalCubemap(texture);
 	public ITexture? GetLocalCubemap() => ctx.GetLocalCubemap();
 	public void SetLightingOrigin(Vector3 lightingOrigin) => ctx.SetLightingOrigin(lightingOrigin);

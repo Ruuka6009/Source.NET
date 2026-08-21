@@ -1233,6 +1233,76 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	}
 
 	/// <summary>
+	/// Blits whatever is currently in the colour attachment into a texture. Copies are illegal
+	/// inside a rendering pass, so the open pass is closed first and reopened by the next draw -
+	/// the render-target machinery already handles that, which is what makes this cheap to add.
+	/// </summary>
+	public unsafe void CopyRenderTargetToTexture(ShaderAPITextureHandle_t textureHandle) {
+		if (IsDeactivated() || !textures.TryGetValue(textureHandle, out VulkanTexture? dst))
+			return;
+
+		FlushBufferedPrimitives();
+		if (!EnsureFrameStarted())
+			return;
+
+		frameLoop!.EndRendering();
+		renderTargetDirty = true;   // the next draw reopens the pass
+
+		CommandBuffer cmd = frameLoop.Cmd;
+		Vk vk = core!.Vk;
+
+		// Source of the copy: whatever is being rendered into right now.
+		Image srcImage;
+		Extent2D srcExtent;
+		ImageLayout srcLayout;
+		if (renderTargetColor == null) {
+			srcImage = swapchain!.Images[frameLoop.CurrentImageIndex];
+			srcExtent = swapchain.Extent;
+			srcLayout = ImageLayout.ColorAttachmentOptimal;
+		}
+		else {
+			srcImage = renderTargetColor.CurrentImage;
+			srcExtent = new Extent2D((uint)renderTargetColor.Width, (uint)renderTargetColor.Height);
+			srcLayout = renderTargetColor.Layouts[renderTargetColor.CurrentCopy];
+		}
+
+		if (srcImage.Handle == dst.CurrentImage.Handle)
+			return;
+
+		frameLoop.TransitionImage(cmd, srcImage, ImageAspectFlags.ColorBit,
+			srcLayout, ImageLayout.TransferSrcOptimal,
+			PipelineStageFlags2.ColorAttachmentOutputBit, AccessFlags2.ColorAttachmentWriteBit,
+			PipelineStageFlags2.TransferBit, AccessFlags2.TransferReadBit);
+
+		TransitionTexture(cmd, dst, ImageLayout.TransferDstOptimal);
+
+		// Blit rather than copy: the texture is rarely the same size as the frame, and blit
+		// handles both the scale and any format difference.
+		ImageBlit region = new() {
+			SrcSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1),
+			DstSubresource = new ImageSubresourceLayers(ImageAspectFlags.ColorBit, 0, 0, 1)
+		};
+		region.SrcOffsets[0] = new Offset3D(0, 0, 0);
+		region.SrcOffsets[1] = new Offset3D((int)srcExtent.Width, (int)srcExtent.Height, 1);
+		region.DstOffsets[0] = new Offset3D(0, 0, 0);
+		region.DstOffsets[1] = new Offset3D(dst.Width, dst.Height, 1);
+
+		vk.CmdBlitImage(cmd, srcImage, ImageLayout.TransferSrcOptimal,
+			dst.CurrentImage, ImageLayout.TransferDstOptimal, 1, &region, Filter.Linear);
+
+		// Put both sides back: the frame keeps rendering, the texture becomes sampleable.
+		frameLoop.TransitionImage(cmd, srcImage, ImageAspectFlags.ColorBit,
+			ImageLayout.TransferSrcOptimal, srcLayout,
+			PipelineStageFlags2.TransferBit, AccessFlags2.TransferReadBit,
+			PipelineStageFlags2.ColorAttachmentOutputBit, AccessFlags2.ColorAttachmentWriteBit);
+
+		TransitionTexture(cmd, dst, ImageLayout.ShaderReadOnlyOptimal);
+
+		dst.RenderedTo = true;      // it has content now, so it will bind instead of the white fallback
+		lastTextureSetValid = false;
+	}
+
+	/// <summary>
 	/// Closes any open pass, moves the attachments into the layouts they need, and opens a pass on
 	/// the current target. A texture that was being rendered into goes back to shader-read so it
 	/// can be sampled by whatever comes next.

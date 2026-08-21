@@ -124,6 +124,14 @@ public class MaterialSystem : IMaterialSystem, IShaderUtil
 		ShaderSystem = services.GetRequiredService<IShaderSystem>();
 		Config = services.GetRequiredService<MaterialSystem_Config>()!;
 
+		// Pick the graphics driver before anything touches the shader system, so
+		// shader extensions/window flags/context creation all agree on the backend.
+		ICommandLine commandLine = services.GetRequiredService<ICommandLine>();
+		if (commandLine.CheckParm("-vulkan"))
+			Config.Driver = GraphicsDriver.Vulkan13;
+		else if (commandLine.CheckParm("-gl"))
+			Config.Driver = GraphicsDriver.OpenGL46;
+
 		// Link up
 		ShaderAPI.PreInit(this, services);
 

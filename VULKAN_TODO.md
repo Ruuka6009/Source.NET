@@ -17,31 +17,36 @@ The contract a Vulkan backend must satisfy is `Source.Common/ShaderAPI/`: `IShad
 
 ## Phase 0 — decide first
 
-- [ ] Pick a binding. Silk.NET.Vulkan is the sane default (actively maintained, same ecosystem as the SDL3 usage).
-- [ ] Keep GL alive alongside Vulkan rather than deleting it. `GraphicsDriver` is already a flags enum, so both can coexist and be A/B'd. Deleting GL first means debugging a black screen with no reference.
+- [x] Pick a binding. **Decision: Silk.NET.Vulkan** (actively maintained, same ecosystem as the SDL3 usage).
+- [x] Keep GL alive alongside Vulkan rather than deleting it. `GraphicsDriver` is already a flags enum, so both can coexist and be A/B'd. Deleting GL first means debugging a black screen with no reference. **Decision: GL stays; `-vulkan` opts in.**
 - [ ] Shader toolchain: GLSL -> SPIR-V via glslang/shaderc, run at build time, output next to the GLSL.
+      Note: shader sources live in `Source.StdShader.Gl46/` (copied into `Game.Assets/hl2/shaders/` at build), so the compile step belongs in the StdShader csproj.
 
-## Phase 1 — widen the seams (all in existing code, no Vulkan yet)
+## Phase 1 — widen the seams (all in existing code, no Vulkan yet) — DONE
 
-Do this whole phase before writing any Vulkan. It is independently testable — GL must still work at the end of it.
+Verified against code 2026-08-21; GL still builds and remains the default.
 
-- [ ] `Source.Common/ShaderAPI/IShaderDevice.cs:9-24` — add `Vulkan` to `GraphicsDriver`.
-- [ ] `Source.Common/ShaderAPI/IShaderDevice.cs:46-59` — the shader-extension switch returns `gl460.fs` etc. Add the Vulkan case (`.spv`, or `vulkan.fs.spv`).
-- [ ] `Source.SDLManager/SDL3_LauncherManager.cs:104` — driver is hardcoded to `OpenGL46` (there is already a `// todo, dont hardcode`). Drive it from config/cmdline.
-- [ ] `Source.Common/MaterialSystem/MaterialSystem_Config.cs:40` — same hardcode, same fix.
-- [ ] `Source.Bitmap/ImageLoader.cs:223-227` — raw `GL_RGBA32F` / `GL_COMPRESSED_*` constants live in a driver-neutral project. Replace with a neutral format enum + per-backend translation table.
-- [ ] `Game.UI/OptionsSubVideo.cs:194` — calls `Gl46.glGetStringSafe(GL_VERSION)` directly for the version string. Move behind `IShaderDevice`.
-- [ ] `Source.SDLManager/SDL3_LauncherManager.cs:70` — `SDL3_OpenGL46_Context : IGraphicsContext` wraps `SDL_GL_MakeCurrent`/`SwapWindow`. Add a sibling Vulkan context; note `Present` is a queue submit, not a swap, so check `IGraphicsContext` still fits.
-- [ ] Window creation needs `SDL_WINDOW_VULKAN` instead of the GL flag.
+- [x] ~~add `Vulkan` to `GraphicsDriver`~~ — already existed (`1 << 60`). Added `Vulkan13 = Vulkan | 13` (targets Vulkan 1.3: dynamic rendering, sync2).
+- [x] `IShaderDevice.cs` — `Extension()` now returns `vk13.{vs,fs,gs}.spv` for Vulkan.
+- [x] `SDL3_LauncherManager.CreateGameWindow` — hardcode removed; reads `materials.GetCurrentConfigForVideoCard().Driver`. (The `SDL_WINDOW_VULKAN` switch case already existed.)
+- [x] `MaterialSystem_Config.Driver` — still defaults to `OpenGL46`, but `MaterialSystem`'s ctor overrides it from the command line (`-vulkan` / `-gl`) before the shader system spins up. `SysModes.cs:115` already fed `PrepareContext` from this config, so it is the single source of truth.
+- [x] `ImageLoader.cs` — GL constants/tables moved to `Source.ShaderAPI.Gl46/ImageFormatGl46.cs`. No new neutral enum needed: `ImageFormat` *is* the neutral enum; each backend owns its translation table (grep confirms only ShaderAPIGl46 consumed them).
+- [x] `OptionsSubVideo.cs` — direct `glGetStringSafe(GL_VERSION)` replaced with `IShaderDevice.GetDriverVersionString()` (new interface member). Game.UI no longer touches OpenGL. (Labels still say "OpenGL level:" — cosmetic, fix when Vulkan works.)
+- [x] `PrepareContext` — Vulkan returns true (no pre-window GL attributes needed).
+- [ ] Sibling Vulkan `IGraphicsContext` — deferred to Phase 2 (needs the backend to exist). `IGraphicsContext` fits: `MakeCurrent` becomes a no-op, `SwapBuffers` means "present", `SetSwapInterval` selects present mode at swapchain creation. `CreateContext` still warns+null for Vulkan until then.
 
 ## Phase 2 — device bring-up
 
-- [ ] Instance + validation layers (turn them on from day one, behind a convar).
-- [ ] Physical device selection, queue families (graphics + present, possibly transfer).
-- [ ] Surface via `SDL_Vulkan_CreateSurface`.
-- [ ] Swapchain + recreation on resize/alt-tab. This will be the first thing that breaks.
-- [ ] Frames in flight, command pools/buffers, semaphores + fences.
-- [ ] Goal for this phase: clear the screen to a colour. Nothing else.
+`Source.ShaderAPI.Vulkan` project exists (Silk.NET.Vulkan 2.23). Code written, compiles, **not yet
+wired into the launcher and not yet run** — runtime-verify each box before ticking the goal.
+
+- [x] Instance + validation layers — `VulkanCore.cs`; `vk_validation` convar (default 1), debug-utils messenger routed to Warning().
+- [x] Physical device selection, queue families — discrete > integrated scoring; requires graphics+present, swapchain ext, 1.3 dynamic rendering + sync2; prefers a single graphics+present family.
+- [x] Surface via `SDL_Vulkan_CreateSurface` — done through new `IGraphicsProvider` hooks (`GetVulkanInstanceExtensions` / `CreateVulkanSurface` / `DestroyVulkanSurface` / `GetVulkanPresentationSupport`) implemented in `SDL3_LauncherManager`, so the backend never touches SDL directly.
+- [x] Swapchain + recreation — `VulkanSwapchain.cs`; sRGB BGRA8 preferred, mailbox > immediate when vsync off, `OldSwapchain` chained on recreate.
+- [x] Frames in flight (2), command pools/buffers, semaphores + fences — `VulkanFrameLoop.cs`, sync2 (`QueueSubmit2`/`CmdPipelineBarrier2`), dynamic rendering clear pass, out-of-date -> `NeedsRecreate`.
+- [x] `VulkanGraphicsContext : IGraphicsContext` — MakeCurrent no-op, SwapBuffers no-op (present at submit), SetSwapInterval flags a swapchain recreate.
+- [ ] **Goal: clear the screen to a colour.** Remaining: a `ShaderDeviceVulkan` shim implementing enough of `IShaderAPI`/`IShaderDevice` to boot with `-vulkan`, wire `Program.cs` selection, then actually run it.
 
 ## Phase 3 — the actual hard part: state machine -> pipelines
 
@@ -85,3 +90,8 @@ mismatch is the bulk of the work.
 - ~7.7k lines of backend code to reimplement. The MaterialSystem's 10.6k lines should stay untouched —
   if they don't, the seams in Phase 1 were wrong.
 - RenderDoc + validation layers from the first triangle, not after things break.
+- Reference: [TF2Vulkan](https://github.com/PazerOP/TF2Vulkan) — the same idea for TF2's shaderapidx9.
+  Transferable pieces: a `LogicalState` layer split into static (shadow) and dynamic state managers,
+  resolved into a `GraphicsPipeline` cache at draw time (validates Phase 3); vk_mem_alloc for buffers
+  (Phase 4); `FormatInfo`/`FormatConverter` as a dedicated module (matches the ImageFormatGl46 split).
+  It died to unresolved device-lost errors — one more reason validation layers go on from day one.

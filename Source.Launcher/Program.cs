@@ -126,11 +126,11 @@ public class Bootloader : IDisposable
 	const string defaultHalfLife2GameDirectory = "hl2";
 
 	private string DetermineInitialMod() {
-		return !isEditMode ? commandLine.ParmValue("-game", defaultHalfLife2GameDirectory) : throw new NotImplementedException("No editmode support");
+		return !isEditMode ? commandLine.ParmValue("-game -vulkan", defaultHalfLife2GameDirectory) : throw new NotImplementedException("No editmode support");
 	}
 
 	private string DetermineInitialGame() {
-		return !isEditMode ? commandLine.ParmValue("-game", defaultHalfLife2GameDirectory) : throw new NotImplementedException("No editmode support");
+		return !isEditMode ? commandLine.ParmValue("-game -vulkan", defaultHalfLife2GameDirectory) : throw new NotImplementedException("No editmode support");
 	}
 	public void Dispose() {
 		SteamAPI.Shutdown();

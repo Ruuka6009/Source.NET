@@ -8,6 +8,7 @@ using Source.Common.GUI;
 using Source.Common.Input;
 using Source.Common.MaterialSystem;
 using Source.Common.Networking;
+using Source.Common.ShaderAPI;
 using Source.Engine;
 using Source.GUI.Controls;
 
@@ -191,7 +192,7 @@ class OptionsSubVideoAdvancedDlg : Frame
 		dxLabel = FindChildByName("Label2") as Label;
 		dxLabel?.SetText("Software OpenGL level:");
 
-		ReadOnlySpan<char> version = OpenGL.Gl46.glGetStringSafe(OpenGL.Gl46.GL_VERSION).Split(' ')[0];
+		ReadOnlySpan<char> version = Singleton<IShaderDevice>().GetDriverVersionString().ToString().Split(' ')[0];
 		dxLabel = FindChildByName("dxinstalledlabel") as Label;
 		dxLabel?.SetText(version);
 		SetControlString("dxlabel", version);

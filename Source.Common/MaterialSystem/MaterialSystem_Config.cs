@@ -37,7 +37,8 @@ public class MaterialSystem_Config
 	public float GammaTVExponent;
 	public bool GammaTVEnabled;
 
-	public GraphicsDriver Driver = GraphicsDriver.OpenGL46; // todo; get this some other way?
+	// Default driver; MaterialSystem overrides this from the command line (-vulkan / -gl) at startup.
+	public GraphicsDriver Driver = GraphicsDriver.OpenGL46;
 
 	public int AASamples;
 	public int ForceAnisotropicLevel;

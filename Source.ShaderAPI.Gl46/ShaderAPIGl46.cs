@@ -84,6 +84,7 @@ public class ShaderAPIGl46 : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	}
 
 	public GraphicsDriver GetDriver() => Driver;
+	public ReadOnlySpan<char> GetDriverVersionString() => glGetStringSafe(GL_VERSION);
 	private bool ready;
 
 	uint renderFBO;
@@ -1515,12 +1516,12 @@ public class ShaderAPIGl46 : IShaderAPI, IShaderDevice, IDebugTextureInfo
 				Span<byte> data = vtf.ImageData(vtfFrame, face, mip);
 				if (info.SrcFormat.IsCompressed()) {
 					fixed (byte* bytes = data)
-						glCompressedTextureSubImage3D((uint)info.Texture, mip, 0, 0, face, w, h, 1, ImageLoader.GetGLImageInternalFormat(info.SrcFormat), data.Length, bytes);
+						glCompressedTextureSubImage3D((uint)info.Texture, mip, 0, 0, face, w, h, 1, ImageFormatGl46.GetGLImageInternalFormat(info.SrcFormat), data.Length, bytes);
 				}
 				else {
 					ConvertDataToAcceptableGLFormat(info.SrcFormat, data, out ImageFormat uploadFormat, out Span<byte> convertedData);
 					fixed (byte* bytes = convertedData)
-						glTextureSubImage3D((uint)info.Texture, mip, 0, 0, face, w, h, 1, ImageLoader.GetGLImageUploadFormat(uploadFormat), GL_UNSIGNED_BYTE, bytes);
+						glTextureSubImage3D((uint)info.Texture, mip, 0, 0, face, w, h, 1, ImageFormatGl46.GetGLImageUploadFormat(uploadFormat), GL_UNSIGNED_BYTE, bytes);
 				}
 			}
 		}
@@ -1533,7 +1534,7 @@ public class ShaderAPIGl46 : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		if (info.SrcFormat.IsCompressed()) {
 			Span<byte> data = vtf.ImageData(vtfFrame, 0, info.Level);
 			fixed (byte* bytes = data)
-				glCompressedTextureSubImage2D((uint)info.Texture, info.Level, 0, 0, w, h, ImageLoader.GetGLImageInternalFormat(info.SrcFormat), data.Length, bytes);
+				glCompressedTextureSubImage2D((uint)info.Texture, info.Level, 0, 0, w, h, ImageFormatGl46.GetGLImageInternalFormat(info.SrcFormat), data.Length, bytes);
 			// Msg("err: " + glGetErrorName() + "\n");
 		}
 		else {
@@ -1605,7 +1606,7 @@ public class ShaderAPIGl46 : IShaderAPI, IShaderDevice, IDebugTextureInfo
 			if (copies <= 1) {
 				texture.NumCopies = 1;
 				uint glTex = glCreateTexture(texture.DetermineGLObjectType());
-				glTextureStorage2D(glTex, mipCount, ImageLoader.GetGLImageInternalFormat(dstFormat), width, height);
+				glTextureStorage2D(glTex, mipCount, ImageFormatGl46.GetGLImageInternalFormat(dstFormat), width, height);
 				glObjectLabel(GL_TEXTURE, glTex, $"ShaderAPI Texture '{debugName.SliceNullTerminatedString()}' [frame {i}]");
 				texture.SetTexture(glTex);
 			}
@@ -1614,7 +1615,7 @@ public class ShaderAPIGl46 : IShaderAPI, IShaderDevice, IDebugTextureInfo
 				texture.TextureCopies = new uint[copies];
 				for (int k = 0; k < copies; k++) {
 					uint glTex = glCreateTexture(texture.DetermineGLObjectType());
-					glTextureStorage2D(glTex, mipCount, ImageLoader.GetGLImageInternalFormat(dstFormat), width, height);
+					glTextureStorage2D(glTex, mipCount, ImageFormatGl46.GetGLImageInternalFormat(dstFormat), width, height);
 					glObjectLabel(GL_TEXTURE, glTex, $"ShaderAPI Texture '{debugName.SliceNullTerminatedString()}' [frame {i} copy {k}]");
 					texture.SetTexture(k, glTex);
 				}
@@ -1886,7 +1887,7 @@ public class ShaderAPIGl46 : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		glPixelStorei(GL_UNPACK_ROW_LENGTH, srcStride / srcFormat.SizeInBytes());
 		ConvertDataToAcceptableGLFormat(srcFormat, imageData, out srcFormat, out Span<byte> convertedData);
 		fixed (byte* data = convertedData)
-			glTextureSubImage2D((uint)info.Texture, mip, xOffset, yOffset, width >> mip, height >> mip, ImageLoader.GetGLImageUploadFormat(srcFormat), GL_UNSIGNED_BYTE, data);
+			glTextureSubImage2D((uint)info.Texture, mip, xOffset, yOffset, width >> mip, height >> mip, ImageFormatGl46.GetGLImageUploadFormat(srcFormat), GL_UNSIGNED_BYTE, data);
 		glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 		var err = glGetError();
 		// System.Diagnostics.Debug.Assert(err == 0);
@@ -1910,7 +1911,7 @@ public class ShaderAPIGl46 : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		glPixelStorei(GL_UNPACK_ROW_LENGTH, srcStride / srcFormat.SizeInBytes());
 		ConvertDataToAcceptableGLFormat(srcFormat, imageData, out srcFormat, out Span<byte> convertedData);
 		fixed (byte* data = convertedData)
-			glTextureSubImage2D(GetModifyTexture(), mip, x, y, width >> mip, height >> mip, ImageLoader.GetGLImageUploadFormat(srcFormat), GL_UNSIGNED_BYTE, data);
+			glTextureSubImage2D(GetModifyTexture(), mip, x, y, width >> mip, height >> mip, ImageFormatGl46.GetGLImageUploadFormat(srcFormat), GL_UNSIGNED_BYTE, data);
 		glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 		var err = glGetError();
 		// System.Diagnostics.Debug.Assert(err == 0);
@@ -2307,7 +2308,7 @@ public class ShaderAPIGl46 : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	public unsafe void TexUnlock() {
 		glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 		fixed (byte* data = lockdata)
-			glTextureSubImage2D(GetGL46Texture(Lock.Handle), Lock.Mip, Lock.X, Lock.Y, Lock.W, Lock.H, ImageLoader.GetGLImageUploadFormat(Lock.Format), GL_UNSIGNED_BYTE, data);
+			glTextureSubImage2D(GetGL46Texture(Lock.Handle), Lock.Mip, Lock.X, Lock.Y, Lock.W, Lock.H, ImageFormatGl46.GetGLImageUploadFormat(Lock.Format), GL_UNSIGNED_BYTE, data);
 		Lock = default;
 	}
 

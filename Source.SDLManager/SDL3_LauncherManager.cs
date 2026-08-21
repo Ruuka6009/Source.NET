@@ -101,7 +101,7 @@ public unsafe class SDL3_LauncherManager : ILauncherManager, IGraphicsProvider
 		IMaterialSystem materials = services.GetRequiredService<IMaterialSystem>();
 
 		SDL_WindowFlags flags = default;
-		GraphicsDriver driver = GraphicsDriver.OpenGL46; // todo, dont hardcode
+		GraphicsDriver driver = materials.GetCurrentConfigForVideoCard().Driver;
 		switch(driver.GetDriver()){
 			case GraphicsDriver.OpenGL: flags |= SDL_WindowFlags.SDL_WINDOW_OPENGL; break;
 			case GraphicsDriver.Metal: flags |= SDL_WindowFlags.SDL_WINDOW_METAL; break;
@@ -313,6 +313,10 @@ public unsafe class SDL3_LauncherManager : ILauncherManager, IGraphicsProvider
 	}
 
 	public bool PrepareContext(GraphicsDriver driver) {
+		// Vulkan needs no pre-window attributes; instance/device setup happens in the backend.
+		if (driver.IsDriver(GraphicsDriver.Vulkan))
+			return true;
+
 		if (0 != (driver & GraphicsDriver.OpenGL)) {
 			switch ((driver & ~GraphicsDriver.OpenGL)) {
 				default:
@@ -360,6 +364,37 @@ public unsafe class SDL3_LauncherManager : ILauncherManager, IGraphicsProvider
 	}
 
 	public delegate* unmanaged[Cdecl]<byte*, void*> GL_LoadExtensionsPtr() => &GL_ProcAddress;
+
+	public string[] GetVulkanInstanceExtensions() {
+		uint count;
+		byte** exts = SDL3.SDL_Vulkan_GetInstanceExtensions(&count);
+		if (exts == null) {
+			Warning($"SDL_Vulkan_GetInstanceExtensions failed: {SDL3.SDL_GetError()}\n");
+			return [];
+		}
+		string[] result = new string[count];
+		for (uint i = 0; i < count; i++)
+			result[i] = SDL3.PtrToStringUTF8(exts[i]) ?? string.Empty;
+		return result;
+	}
+
+	public nint CreateVulkanSurface(nint vkInstance, IWindow window) {
+		VkSurfaceKHR_T* surface;
+		SDL_Window* handle = ((SDL3_Window)window).HardwareHandle;
+		if (!SDL3.SDL_Vulkan_CreateSurface(handle, (VkInstance_T*)vkInstance, null, &surface)) {
+			Warning($"SDL_Vulkan_CreateSurface failed: {SDL3.SDL_GetError()}\n");
+			return 0;
+		}
+		return (nint)surface;
+	}
+
+	public void DestroyVulkanSurface(nint vkInstance, nint vkSurface) {
+		SDL3.SDL_Vulkan_DestroySurface((VkInstance_T*)vkInstance, (VkSurfaceKHR_T*)vkSurface, null);
+	}
+
+	public bool GetVulkanPresentationSupport(nint vkInstance, nint vkPhysicalDevice, uint queueFamilyIndex) {
+		return SDL3.SDL_Vulkan_GetPresentationSupport((VkInstance_T*)vkInstance, (VkPhysicalDevice_T*)vkPhysicalDevice, queueFamilyIndex);
+	}
 
 	ICursor[] DefaultCursors;
 

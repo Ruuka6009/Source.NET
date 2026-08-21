@@ -5,15 +5,19 @@ using VkSemaphore = Silk.NET.Vulkan.Semaphore;
 namespace Source.ShaderAPI.Vulkan;
 
 /// <summary>
-/// Frames-in-flight, command pools/buffers and the acquire -> record -> submit -> present cycle.
-/// Phase 2 goal: clear the screen to a colour. Nothing else.
+/// Frames-in-flight, command pools/buffers, the depth buffer and the
+/// acquire -> record -> submit -> present cycle. Phase 3/4 shape: BeginFrame opens a dynamic
+/// rendering pass (color+depth cleared) that draws are recorded into; EndFrameAndPresent closes,
+/// submits and presents it. A frame with no draws still clears (the Phase 2 boot behaviour).
 /// </summary>
 public unsafe class VulkanFrameLoop : IDisposable
 {
 	public const int FramesInFlight = 2;
+	public const Format DepthFormat = Format.D32Sfloat;
 
 	readonly VulkanCore core;
 	readonly VulkanSwapchain swapchain;
+	readonly VulkanMemoryAllocator allocator;
 
 	CommandPool commandPool;
 	readonly CommandBuffer[] commandBuffers = new CommandBuffer[FramesInFlight];
@@ -23,13 +27,25 @@ public unsafe class VulkanFrameLoop : IDisposable
 	VkSemaphore[] renderFinished = [];
 	readonly Fence[] inFlight = new Fence[FramesInFlight];
 	int currentFrame;
+	uint currentImageIndex;
+
+	Image depthImage;
+	ImageView depthImageView;
+	VulkanMemoryAllocator.Allocation depthAlloc;
 
 	/// <summary>Set when acquire/present reported out-of-date; owner must Recreate the swapchain.</summary>
 	public bool NeedsRecreate { get; private set; }
 
-	public VulkanFrameLoop(VulkanCore core, VulkanSwapchain swapchain) {
+	/// <summary>True between a successful BeginFrame and EndFrameAndPresent.</summary>
+	public bool FrameActive { get; private set; }
+
+	public CommandBuffer Cmd => commandBuffers[currentFrame];
+	public int FrameIndex => currentFrame;
+
+	public VulkanFrameLoop(VulkanCore core, VulkanSwapchain swapchain, VulkanMemoryAllocator allocator) {
 		this.core = core;
 		this.swapchain = swapchain;
+		this.allocator = allocator;
 	}
 
 	public bool Init() {
@@ -67,13 +83,14 @@ public unsafe class VulkanFrameLoop : IDisposable
 				return false;
 			}
 		}
-		return CreateRenderFinishedSemaphores();
+		return OnSwapchainRecreated();
 	}
 
-	/// <summary>(Re)creates the per-swapchain-image present semaphores. Call after swapchain (re)creation.</summary>
-	public bool CreateRenderFinishedSemaphores() {
+	/// <summary>Recreates the per-image present semaphores and the depth buffer. Call after swapchain (re)creation.</summary>
+	public bool OnSwapchainRecreated() {
 		Vk vk = core.Vk;
 		vk.DeviceWaitIdle(core.Device);
+
 		foreach (VkSemaphore semaphore in renderFinished)
 			if (semaphore.Handle != 0)
 				vk.DestroySemaphore(core.Device, semaphore, null);
@@ -86,11 +103,73 @@ public unsafe class VulkanFrameLoop : IDisposable
 				return false;
 			}
 		}
+
+		return CreateDepthBuffer();
+	}
+
+	bool CreateDepthBuffer() {
+		Vk vk = core.Vk;
+
+		DestroyDepthBuffer();
+
+		ImageCreateInfo imageInfo = new() {
+			SType = StructureType.ImageCreateInfo,
+			ImageType = ImageType.Type2D,
+			Format = DepthFormat,
+			Extent = new Extent3D(swapchain.Extent.Width, swapchain.Extent.Height, 1),
+			MipLevels = 1,
+			ArrayLayers = 1,
+			Samples = SampleCountFlags.Count1Bit,
+			Tiling = ImageTiling.Optimal,
+			Usage = ImageUsageFlags.DepthStencilAttachmentBit,
+			SharingMode = SharingMode.Exclusive,
+			InitialLayout = ImageLayout.Undefined
+		};
+		if (vk.CreateImage(core.Device, &imageInfo, null, out depthImage) != Result.Success) {
+			Warning("Vulkan: depth image creation failed\n");
+			return false;
+		}
+
+		vk.GetImageMemoryRequirements(core.Device, depthImage, out MemoryRequirements reqs);
+		depthAlloc = allocator.Allocate(in reqs, MemoryPropertyFlags.DeviceLocalBit);
+		vk.BindImageMemory(core.Device, depthImage, depthAlloc.Memory, depthAlloc.Offset);
+
+		ImageViewCreateInfo viewInfo = new() {
+			SType = StructureType.ImageViewCreateInfo,
+			Image = depthImage,
+			ViewType = ImageViewType.Type2D,
+			Format = DepthFormat,
+			SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.DepthBit, 0, 1, 0, 1)
+		};
+		if (vk.CreateImageView(core.Device, &viewInfo, null, out depthImageView) != Result.Success) {
+			Warning("Vulkan: depth image view creation failed\n");
+			return false;
+		}
 		return true;
 	}
 
-	/// <summary>Clears the current swapchain image to the given colour and presents it.</summary>
-	public void DrawClearFrame(float r, float g, float b) {
+	void DestroyDepthBuffer() {
+		Vk vk = core.Vk;
+		if (depthImageView.Handle != 0) {
+			vk.DestroyImageView(core.Device, depthImageView, null);
+			depthImageView = default;
+		}
+		if (depthImage.Handle != 0) {
+			vk.DestroyImage(core.Device, depthImage, null);
+			allocator.Free(in depthAlloc);
+			depthImage = default;
+			depthAlloc = default;
+		}
+	}
+
+	/// <summary>
+	/// Acquires the next image and opens the frame's rendering pass, clearing color+depth.
+	/// Returns false when the swapchain needs recreation (NeedsRecreate) or on failure.
+	/// </summary>
+	public bool BeginFrame(float r, float g, float b) {
+		if (FrameActive)
+			return true;
+
 		Vk vk = core.Vk;
 		NeedsRecreate = false;
 
@@ -100,12 +179,13 @@ public unsafe class VulkanFrameLoop : IDisposable
 		Result acquire = core.KhrSwapchain.AcquireNextImage(core.Device, swapchain.Swapchain, ulong.MaxValue, imageAvailable[currentFrame], default, &imageIndex);
 		if (acquire == Result.ErrorOutOfDateKhr) {
 			NeedsRecreate = true;
-			return;
+			return false;
 		}
 		if (acquire != Result.Success && acquire != Result.SuboptimalKhr) {
 			Warning($"Vulkan: vkAcquireNextImageKHR failed ({acquire})\n");
-			return;
+			return false;
 		}
+		currentImageIndex = imageIndex;
 
 		vk.ResetFences(core.Device, 1, in inFlight[currentFrame]);
 
@@ -115,10 +195,16 @@ public unsafe class VulkanFrameLoop : IDisposable
 		CommandBufferBeginInfo beginInfo = new() { SType = StructureType.CommandBufferBeginInfo };
 		vk.BeginCommandBuffer(cmd, &beginInfo);
 
-		TransitionImage(vk, cmd, swapchain.Images[imageIndex],
+		TransitionImage(vk, cmd, swapchain.Images[imageIndex], ImageAspectFlags.ColorBit,
 			ImageLayout.Undefined, ImageLayout.ColorAttachmentOptimal,
 			PipelineStageFlags2.TopOfPipeBit, 0,
 			PipelineStageFlags2.ColorAttachmentOutputBit, AccessFlags2.ColorAttachmentWriteBit);
+
+		TransitionImage(vk, cmd, depthImage, ImageAspectFlags.DepthBit,
+			ImageLayout.Undefined, ImageLayout.DepthAttachmentOptimal,
+			PipelineStageFlags2.TopOfPipeBit, 0,
+			PipelineStageFlags2.EarlyFragmentTestsBit | PipelineStageFlags2.LateFragmentTestsBit,
+			AccessFlags2.DepthStencilAttachmentReadBit | AccessFlags2.DepthStencilAttachmentWriteBit);
 
 		RenderingAttachmentInfo colorAttachment = new() {
 			SType = StructureType.RenderingAttachmentInfo,
@@ -128,17 +214,71 @@ public unsafe class VulkanFrameLoop : IDisposable
 			StoreOp = AttachmentStoreOp.Store,
 			ClearValue = new ClearValue(new ClearColorValue(r, g, b, 1.0f))
 		};
+		RenderingAttachmentInfo depthAttachment = new() {
+			SType = StructureType.RenderingAttachmentInfo,
+			ImageView = depthImageView,
+			ImageLayout = ImageLayout.DepthAttachmentOptimal,
+			LoadOp = AttachmentLoadOp.Clear,
+			StoreOp = AttachmentStoreOp.DontCare,
+			ClearValue = new ClearValue(depthStencil: new ClearDepthStencilValue(1.0f, 0))
+		};
 		RenderingInfo renderingInfo = new() {
 			SType = StructureType.RenderingInfo,
 			RenderArea = new Rect2D(new Offset2D(0, 0), swapchain.Extent),
 			LayerCount = 1,
 			ColorAttachmentCount = 1,
-			PColorAttachments = &colorAttachment
+			PColorAttachments = &colorAttachment,
+			PDepthAttachment = &depthAttachment
 		};
 		vk.CmdBeginRendering(cmd, &renderingInfo);
+
+		FrameActive = true;
+		return true;
+	}
+
+	/// <summary>Mid-frame clear (the engine's explicit ClearBuffers) inside the open rendering pass.</summary>
+	public void ClearAttachments(bool clearColor, bool clearDepth, float r, float g, float b, Rect2D rect) {
+		if (!FrameActive)
+			return;
+
+		Vk vk = core.Vk;
+		ClearAttachment* clears = stackalloc ClearAttachment[2];
+		int count = 0;
+		if (clearColor) {
+			clears[count++] = new ClearAttachment {
+				AspectMask = ImageAspectFlags.ColorBit,
+				ColorAttachment = 0,
+				ClearValue = new ClearValue(new ClearColorValue(r, g, b, 1.0f))
+			};
+		}
+		if (clearDepth) {
+			clears[count++] = new ClearAttachment {
+				AspectMask = ImageAspectFlags.DepthBit,
+				ClearValue = new ClearValue(depthStencil: new ClearDepthStencilValue(1.0f, 0))
+			};
+		}
+		if (count == 0)
+			return;
+
+		if (rect.Extent.Width == 0 || rect.Extent.Height == 0)
+			rect = new Rect2D(new Offset2D(0, 0), swapchain.Extent);
+
+		ClearRect clearRect = new() { Rect = rect, BaseArrayLayer = 0, LayerCount = 1 };
+		vk.CmdClearAttachments(Cmd, (uint)count, clears, 1, &clearRect);
+	}
+
+	/// <summary>Closes the frame's rendering pass, submits, presents and advances the frame index.</summary>
+	public void EndFrameAndPresent() {
+		if (!FrameActive)
+			return;
+
+		Vk vk = core.Vk;
+		CommandBuffer cmd = commandBuffers[currentFrame];
+		uint imageIndex = currentImageIndex;
+
 		vk.CmdEndRendering(cmd);
 
-		TransitionImage(vk, cmd, swapchain.Images[imageIndex],
+		TransitionImage(vk, cmd, swapchain.Images[imageIndex], ImageAspectFlags.ColorBit,
 			ImageLayout.ColorAttachmentOptimal, ImageLayout.PresentSrcKhr,
 			PipelineStageFlags2.ColorAttachmentOutputBit, AccessFlags2.ColorAttachmentWriteBit,
 			PipelineStageFlags2.BottomOfPipeBit, 0);
@@ -187,9 +327,10 @@ public unsafe class VulkanFrameLoop : IDisposable
 			Warning($"Vulkan: vkQueuePresentKHR failed ({present})\n");
 
 		currentFrame = (currentFrame + 1) % FramesInFlight;
+		FrameActive = false;
 	}
 
-	static void TransitionImage(Vk vk, CommandBuffer cmd, Image image,
+	static void TransitionImage(Vk vk, CommandBuffer cmd, Image image, ImageAspectFlags aspect,
 		ImageLayout oldLayout, ImageLayout newLayout,
 		PipelineStageFlags2 srcStage, AccessFlags2 srcAccess,
 		PipelineStageFlags2 dstStage, AccessFlags2 dstAccess) {
@@ -204,7 +345,7 @@ public unsafe class VulkanFrameLoop : IDisposable
 			SrcQueueFamilyIndex = Vk.QueueFamilyIgnored,
 			DstQueueFamilyIndex = Vk.QueueFamilyIgnored,
 			Image = image,
-			SubresourceRange = new ImageSubresourceRange(ImageAspectFlags.ColorBit, 0, 1, 0, 1)
+			SubresourceRange = new ImageSubresourceRange(aspect, 0, 1, 0, 1)
 		};
 		DependencyInfo dependencyInfo = new() {
 			SType = StructureType.DependencyInfo,
@@ -217,6 +358,7 @@ public unsafe class VulkanFrameLoop : IDisposable
 	public void Dispose() {
 		Vk vk = core.Vk;
 		vk.DeviceWaitIdle(core.Device);
+		DestroyDepthBuffer();
 		for (int i = 0; i < FramesInFlight; i++) {
 			if (imageAvailable[i].Handle != 0) vk.DestroySemaphore(core.Device, imageAvailable[i], null);
 			if (inFlight[i].Handle != 0) vk.DestroyFence(core.Device, inFlight[i], null);

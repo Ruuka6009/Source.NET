@@ -32,6 +32,8 @@ public unsafe class VulkanCore : IDisposable
 	public string DeviceDescription { get; private set; } = "Vulkan (no device)";
 	public KhrSurface KhrSurface { get; private set; } = null!;
 	public KhrSwapchain KhrSwapchain { get; private set; } = null!;
+	/// <summary>Whether wireframe/point polygon modes are available (fillModeNonSolid).</summary>
+	public bool SupportsFillModeNonSolid { get; private set; }
 
 	ExtDebugUtils? debugUtils;
 	DebugUtilsMessengerEXT debugMessenger;
@@ -275,6 +277,9 @@ public unsafe class VulkanCore : IDisposable
 	}
 
 	bool CreateLogicalDevice() {
+		Vk.GetPhysicalDeviceFeatures(PhysicalDevice, out PhysicalDeviceFeatures supported);
+		SupportsFillModeNonSolid = supported.FillModeNonSolid;
+
 		float priority = 1.0f;
 		uint[] uniqueFamilies = GraphicsQueueFamily == PresentQueueFamily
 			? [GraphicsQueueFamily]
@@ -298,7 +303,8 @@ public unsafe class VulkanCore : IDisposable
 		};
 		PhysicalDeviceFeatures2 features2 = new() {
 			SType = StructureType.PhysicalDeviceFeatures2,
-			PNext = &features13
+			PNext = &features13,
+			Features = new PhysicalDeviceFeatures { FillModeNonSolid = SupportsFillModeNonSolid }
 		};
 
 		byte** extensionsPtr = (byte**)SilkMarshal.StringArrayToPtr(new[] { KhrSwapchain.ExtensionName });

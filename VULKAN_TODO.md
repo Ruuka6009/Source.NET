@@ -54,7 +54,7 @@ wired into the launcher and not yet run** — runtime-verify each box before tic
       (all draw/texture/state calls swallowed; `ShadowStateVulkan`, `ShaderSystemVulkan`, `HardwareConfigVulkan`,
       `DummyMeshVulkan` back the material system). `Program.cs` selects it on `-vulkan`. Verified 2026-08-21 on an
       RTX 3060 (Vulkan 1.4): boots to the running engine loop, presents the clear colour every frame, no exceptions.
-      Validation layers were unavailable on the test machine (no Vulkan SDK installed) — install it before Phase 3.
+      (Validation layers now installed and on by default — `vk_validation 1`.)
 
 ## Phase 3 — the actual hard part: state machine -> pipelines
 
@@ -62,22 +62,71 @@ wired into the launcher and not yet run** — runtime-verify each box before tic
 state machine" — mutable GL-style global state. Vulkan wants immutable `VkPipeline` objects, and this
 mismatch is the bulk of the work.
 
-- [ ] Good news first: `IShaderShadow` (327 lines) is already the *snapshot* concept — Source's shader
-      shadow state is effectively a pipeline description. Map shadow state -> `VkGraphicsPipelineCreateInfo`.
-- [ ] Pipeline cache keyed on hash of (shadow state + vertex format + render target format). Creating
-      pipelines mid-frame will stutter; pre-warm from materials at load.
-- [ ] Use `VK_KHR_dynamic_rendering` to skip render pass/framebuffer objects entirely.
-- [ ] Keep viewport/scissor/blend constants as dynamic state so they don't multiply the pipeline count.
+Implemented 2026-08-21 (session 3), runtime-verified on the RTX 3060 with validation layers ON,
+zero validation errors: `-vulkan` boots to the main menu with **real geometry rendering** (all-white
+UI, because every texture is still the placeholder — see Phase 4).
+
+- [x] `ShadowStateVulkan` captures full `GraphicsBoardState` + `VertexSharedStateVulkan`
+      (NumBones) + `PixelSharedStateVulkan` (alpha test) exactly like `ShadowStateGl46`, but with
+      **no GPU objects** — it is pure data. `Activate()` = publish self as current shadow to the API +
+      `BindVertexShader/BindPixelShader` + replay collected material-var uniforms (→ push-constant flags).
+- [x] Pipeline key = (GraphicsBoardState, vs module, ps module, VertexFormat, topology, color format,
+      depth format). Manual `IEquatable` struct (no memcmp — struct padding). Cache in a Dictionary +
+      last-key fast path (`VulkanPipelines.cs`). Pipelines use dynamic viewport/scissor; rest baked.
+- [x] Dynamic rendering (no render pass objects). Y-flip via **negative viewport height** (GL parity,
+      front face stays CW+cull on).
+- [x] **Matrix upload convention — the gotcha of the session:** GL *transposes* every matrix on its
+      way into the UBO (`ShaderAPIGl46.LoadMatrix`), so Vulkan must too; uploading raw
+      System.Numerics matrices produced diagonal garbage geometry. After the transpose, the GLSL
+      math matrix M has `M[r][c] == Matrix4x4.M(r+1)(c+1)`, so the GL→VK depth remap z' = 0.5*(z+w)
+      edits fields **M31..M34 += M41..M44** on the projection matrix only (see `FixupProjection`).
+      Also GL parity: `LoadMatrix` does NOT flush buffered primitives.
+- [x] Vertex input from `VertexFormat`, same offset order as `ComputeVertexDescription`
+      (`VulkanVertexLayout.cs`). GL attribute locations (Position=0 … TexCoord0=10) are the shader
+      `layout(location)` contract. Attributes a format lacks bind to a 64-byte **zero buffer at
+      binding 1, stride 0** (legal in Vulkan; GL's disabled-attrib default differs only in alpha=1 —
+      accepted; validation emits harmless "attribute not consumed" perf warnings).
+- [x] Descriptor layout contract (matches common_vk13.glsl): set 0 = dynamic-offset UBOs at bindings
+      0 (matrices, 192B) / 2 (vertex shared, 16B) / 3 (pixel shared, 16B) / 4 (bones, 256×64B) /
+      5 (vs_const, 4KB) / 6 (ps_const, 4KB); set 1 = 6 combined image samplers (Sampler enum index =
+      binding); push constants = int flags (vertex|fragment, 4B).
+- [x] Per-frame-in-flight **uniform ring buffer** (host-visible, 16MB, warn+wrap on overflow): each
+      dirty block is memcpy'd to a fresh ring slice at draw-prep; one set-0 descriptor set per frame
+      points at that frame's ring, rebound with new dynamic offsets when any block moved. All blocks
+      dirty at frame start.
+- [x] `LocateShaderUniform`: strips `$`; `"flags"` → id 0 (push constant); anything else → -1 (GL
+      sampler-unit assignments like `"lightmaptexture"→1` are meaningless here — bindings are fixed).
+- [ ] Pre-warm the pipeline cache from materials at load to avoid mid-frame creation stutter.
 
 ## Phase 4 — resources
 
-- [ ] Buffers: `VertexBufferGl46`, `IndexBufferGl46`, `MeshGl46`, `DynamicMeshGl46`, `BufferedMeshGl46`, `MeshMgr`
-      -> `VkBuffer` + a suballocator (VMA-equivalent; do not `vkAllocateMemory` per buffer).
-- [ ] Dynamic meshes need a per-frame ring buffer — they currently assume GL's orphaning behaviour.
-- [ ] Textures: `CreateTextureFlags` (cubemap/rendertarget/dynamic/depth/sRGB) -> `VkImage` + view + sampler,
-      explicit layout transitions, mip upload via staging.
-- [ ] Compressed formats already in use (RGTC, DXT) map to `VK_FORMAT_BC*`.
-- [ ] Descriptor set layouts replacing `glUniform*` and texture bind points. Push constants for per-draw data.
+Buffers/depth done 2026-08-21 (session 3); textures are the next milestone.
+
+- [x] Chunked `VkDeviceMemory` allocator (`VulkanMemory.cs`: 64MB chunks per memory type, first-fit
+      free list, merge on free; one mapped pointer per host-visible chunk). No per-buffer
+      `vkAllocateMemory`.
+- [x] All buffers host-visible+coherent for bring-up; device-local + staging is a later
+      optimization. Sysmem shadow copy stays (MeshBuilder writes there, Unlock memcpys).
+- [x] Ported `VertexBufferGl46/IndexBufferGl46/MeshGl46/DynamicMeshGl46/BufferedMeshGl46/MeshMgr`
+      1:1 (`VertexBufferVulkan.cs`, `IndexBufferVulkan.cs`, `MeshVulkan.cs`). GL orphaning becomes:
+      push live VkBuffer onto a **retire queue** (freed FramesInFlight+1 frame-ticks later) and
+      allocate fresh. `RenderPass()` binds VB/IB + `CmdDrawIndexed(prim.NumIndices, 1,
+      prim.FirstIndex, 0, 0)` (indices are absolute — GL parity).
+- [x] Depth buffer (D32Sfloat) owned by the frame loop, recreated with the swapchain; frame loop is
+      Begin/End recording (lazy frame start on first draw/clear; Present ends+submits+presents;
+      mid-frame `ClearBuffers` = `CmdClearAttachments`; a frame with no draws still clears).
+- [x] 1×1 white placeholder texture + sampler bound for all 6 set-1 slots — the menu currently
+      renders all-white because of this. `BindTexture` is a no-op for now.
+- [ ] **NEXT MILESTONE — real textures:** `CreateTextureFlags` -> `VkImage` + view + sampler, staging
+      uploads, layout transitions, `TexImage2D`/`TexImageFromVTF`/`TexSubImage2D`/`TexLock`, per-draw
+      set-1 descriptor cache keyed on the 6 bound handles (BindTexture currently ignored); compressed
+      formats (RGTC, DXT) -> `VK_FORMAT_BC*`. This turns the white menu into the real menu.
+- [ ] Then render targets (`SetRenderTargetEx` warns and draws to the backbuffer today): dynamic
+      rendering to texture RTs + layout transitions + `DoRenderTargetsNeedSeparateDepthBuffer`.
+- [x] Bones: GL only ever uploads bone 0 = transposed model matrix (`SetSkinningMatrices`) +
+      `LoadBoneMatrix` per-bone transposed writes — mirrored into the bones CPU block, dirty-flagged.
+- [ ] Color meshes (static prop lighting streams) warn-once and are ignored; stencil state is
+      ignored (D32 depth has no stencil aspect) — revisit with world rendering.
 
 ## Phase 5 — shaders
 
@@ -116,3 +165,15 @@ mismatch is the bulk of the work.
   resolved into a `GraphicsPipeline` cache at draw time (validates Phase 3); vk_mem_alloc for buffers
   (Phase 4); `FormatInfo`/`FormatConverter` as a dedicated module (matches the ImageFormatGl46 split).
   It died to unresolved device-lost errors — one more reason validation layers go on from day one.
+- More comparable projects to investigate (user-supplied list, 2026-08-21) — Source-derived codebases
+  with modern/Vulkan backends; mine them when a phase gets stuck (esp. textures, render targets,
+  combo shaders):
+  - Pragma Engine
+  - XenEngine
+  - OpenCSGO / Stephen Cusi's Vulkan work
+  - LambdaComplexSource
+  - Strata Source
+  - nillerusr/source-engine and its forks (Android GL/Vulkan ports of the 2013 SDK)
+  - Source SDK 2013 Vulkan forks
+  - Xash3D Vulkan forks (GoldSrc, but architecturally relevant — see ref_vk's uniform/pipeline
+    mapping of fixed-function state)

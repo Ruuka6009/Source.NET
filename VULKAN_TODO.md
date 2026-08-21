@@ -63,8 +63,15 @@ state machine" — mutable GL-style global state. Vulkan wants immutable `VkPipe
 mismatch is the bulk of the work.
 
 Implemented 2026-08-21 (session 3), runtime-verified on the RTX 3060 with validation layers ON,
-zero validation errors: `-vulkan` boots to the main menu with **real geometry rendering** (all-white
-UI, because every texture is still the placeholder — see Phase 4).
+zero validation errors: `-vulkan` boots to the main menu with real geometry rendering. (Session 4
+added textures, so the menu now renders fully — see Phase 4.)
+
+**Confirming the backend really is Vulkan** (checked 2026-08-21 by diffing loaded modules): with
+`-vulkan` the process maps `vulkan-1.dll` and `SteamOverlayVulkanLayer64.dll` (Steam's overlay only
+injects into a live VkInstance) and never loads `OpenGL46.dll`; with `-gl` it is the exact inverse —
+no `vulkan-1.dll` at all. The two also load different shader assets (`*_vk13.spv` vs `*_gl460`).
+`nvoglv64.dll`/`opengl32.dll` appear in both because SDL3 probes GL when it initialises video,
+regardless of which backend the engine then uses.
 
 - [x] `ShadowStateVulkan` captures full `GraphicsBoardState` + `VertexSharedStateVulkan`
       (NumBones) + `PixelSharedStateVulkan` (alpha test) exactly like `ShadowStateGl46`, but with
@@ -115,14 +122,46 @@ Buffers/depth done 2026-08-21 (session 3); textures are the next milestone.
 - [x] Depth buffer (D32Sfloat) owned by the frame loop, recreated with the swapchain; frame loop is
       Begin/End recording (lazy frame start on first draw/clear; Present ends+submits+presents;
       mid-frame `ClearBuffers` = `CmdClearAttachments`; a frame with no draws still clears).
-- [x] 1×1 white placeholder texture + sampler bound for all 6 set-1 slots — the menu currently
-      renders all-white because of this. `BindTexture` is a no-op for now.
-- [ ] **NEXT MILESTONE — real textures:** `CreateTextureFlags` -> `VkImage` + view + sampler, staging
-      uploads, layout transitions, `TexImage2D`/`TexImageFromVTF`/`TexSubImage2D`/`TexLock`, per-draw
-      set-1 descriptor cache keyed on the 6 bound handles (BindTexture currently ignored); compressed
-      formats (RGTC, DXT) -> `VK_FORMAT_BC*`. This turns the white menu into the real menu.
+- [x] 1×1 white placeholder texture + sampler, still the fallback for any set-1 slot a material
+      does not bind.
+- [x] **Real textures — done 2026-08-21 (session 4), runtime-verified: the menu renders its actual
+      background and text, zero validation errors.** `VulkanTextures.cs` +
+      `ImageFormatVulkan.cs`:
+  - `VulkanTexture` = VkImage(s) + allocation + view + sampler desc; GL's multi-copy textures
+    (`NumCopies`/`SwitchNeeded`) are an array of images with `CurrentCopy`.
+  - **Views are created lazily at bind time covering only the mips actually uploaded** — a VTF
+    supplying fewer levels than the image was created with would otherwise sample uninitialised
+    memory at the small end. Re-created (old one retired for FramesInFlight+1) when a new top mip
+    arrives.
+  - Uploads go through a 32MB staging ring into a **dedicated upload command buffer** (copies are
+    illegal inside the frame's dynamic rendering pass), flushed with a fence wait when the ring
+    fills, before each frame, and before any draw if work is still pending mid-frame.
+  - Samplers are separate objects in Vulkan, so `TexWrap`/`TexMinFilter`/`TexMagFilter` record a
+    `SamplerDesc` on the texture and a cache resolves it at bind time. Anisotropy +
+    `textureCompressionBC` are now enabled device features.
+  - `ImageFormatVulkan` owns the format table *and* the CPU conversions: 3-byte RGB, packed 16-bit,
+    and odd channel orders are not reliably sampleable in Vulkan, so they convert to RGBA8888;
+    DXT1/3/5 -> BC1/2/3, ATI1N/2N -> BC4/BC5 upload untouched.
+  - **Sampler-unit routing — the gotcha of this session:** GL's `Sampler` index is *per shader*
+    (Sampler1 is the lightmap in LightmappedGeneric but basetexture2 in WorldVertexTransition),
+    resolved by the shader setting a sampler uniform to a unit number. The vk13 shaders have fixed
+    set-1 bindings instead, so the same `LocateShaderUniform`/`SetShaderUniform` calls are used in
+    reverse: the name maps to its binding, and the value the shader passes says which unit feeds
+    it. `samplerForBinding` is reset per snapshot so a previous material's routing cannot leak.
+  - set-1 descriptor sets are cached on the six (view, sampler) pairs; pools grow on demand and
+    `DeleteTexture` invalidates any cached set referencing a dying view.
+- [x] **Swapchain is UNORM, not sRGB** (changed this session): the GL backend never enables
+      `GL_FRAMEBUFFER_SRGB`, so an `_Srgb` swapchain gamma-corrected once more than `-gl` did.
+      `CreateTextureFlags.SRGB` is ignored for the same reason. A/B against `-gl` confirms the
+      menus now match.
+- [ ] `TexLock` hands out a zeroed CPU buffer rather than reading the image back (no host-visible
+      copy exists), so a caller that updates only part of its locked rect would clear the rest.
+      Fine for the rects the engine actually locks; revisit if a partial-update case appears.
+- [ ] `DeleteTexture` does a full `vkDeviceWaitIdle` before freeing. Correct but heavy — replace
+      with the frame-tick retire queue the buffers already use.
 - [ ] Then render targets (`SetRenderTargetEx` warns and draws to the backbuffer today): dynamic
       rendering to texture RTs + layout transitions + `DoRenderTargetsNeedSeparateDepthBuffer`.
+      This is the next milestone, and the last big piece before world rendering.
 - [x] Bones: GL only ever uploads bone 0 = transposed model matrix (`SetSkinningMatrices`) +
       `LoadBoneMatrix` per-bone transposed writes — mirrored into the bones CPU block, dirty-flagged.
 - [ ] Color meshes (static prop lighting streams) warn-once and are ignored; stencil state is

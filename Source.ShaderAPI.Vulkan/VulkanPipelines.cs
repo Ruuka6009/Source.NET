@@ -97,7 +97,9 @@ public unsafe class VulkanPipelineSystem : IDisposable
 	public static readonly int[] BlockSizes = [3 * 64, 16, 16, Studio.MAXSTUDIOBONES * 64, 256 * 16, 256 * 16];
 
 	const ulong RingSize = 16UL * 1024 * 1024;
-	const int TextureBindingCount = 6; // set 1: basetexture, envmap, envmapmask, lightmaptexture, bumpmap, basetexture2
+	/// <summary>set 1: basetexture, envmap, envmapmask, lightmaptexture, bumpmap, basetexture2.</summary>
+	public const int TextureBindingCount = 6;
+	const uint SetsPerPool = 512;
 
 	readonly VulkanCore core;
 	readonly VulkanMemoryAllocator allocator;
@@ -119,6 +121,10 @@ public unsafe class VulkanPipelineSystem : IDisposable
 	ImageView whiteImageView;
 	VkSampler whiteSampler;
 	VulkanMemoryAllocator.Allocation whiteImageAlloc;
+
+	/// <summary>1x1 opaque white - the fallback for any set-1 slot a material does not bind.</summary>
+	public ImageView WhiteImageView => whiteImageView;
+	public VkSampler WhiteSampler => whiteSampler;
 
 	ulong uniformAlignment = 256;
 	ulong ringHead;
@@ -197,17 +203,7 @@ public unsafe class VulkanPipelineSystem : IDisposable
 		PipelineLayout = pipelineLayout;
 
 		// --- descriptor pool + sets ---
-		DescriptorPoolSize* poolSizes = stackalloc DescriptorPoolSize[2] {
-			new DescriptorPoolSize(DescriptorType.UniformBufferDynamic, (uint)((int)UniformBlock.Count * framesInFlight)),
-			new DescriptorPoolSize(DescriptorType.CombinedImageSampler, TextureBindingCount * 8)
-		};
-		DescriptorPoolCreateInfo poolInfo = new() {
-			SType = StructureType.DescriptorPoolCreateInfo,
-			MaxSets = (uint)(framesInFlight + 8),
-			PoolSizeCount = 2,
-			PPoolSizes = poolSizes
-		};
-		if (vk.CreateDescriptorPool(core.Device, &poolInfo, null, out descriptorPool) != Result.Success)
+		if (!AddDescriptorPool())
 			return Fail("descriptor pool");
 
 		ringBuffers = new VulkanBufferResource[framesInFlight];
@@ -217,14 +213,7 @@ public unsafe class VulkanPipelineSystem : IDisposable
 		for (int frame = 0; frame < framesInFlight; frame++) {
 			ringBuffers[frame] = VulkanBufferResource.Create(core, allocator, RingSize, BufferUsageFlags.UniformBufferBit);
 
-			DescriptorSetLayout layout = set0Layout;
-			DescriptorSetAllocateInfo allocInfo = new() {
-				SType = StructureType.DescriptorSetAllocateInfo,
-				DescriptorPool = descriptorPool,
-				DescriptorSetCount = 1,
-				PSetLayouts = &layout
-			};
-			if (vk.AllocateDescriptorSets(core.Device, &allocInfo, out set0Sets[frame]) != Result.Success)
+			if (!AllocateSet(set0Layout, out set0Sets[frame]))
 				return Fail("set 0 descriptor set");
 
 			for (int i = 0; i < (int)UniformBlock.Count; i++) {
@@ -254,6 +243,53 @@ public unsafe class VulkanPipelineSystem : IDisposable
 	static bool Fail(string what) {
 		Warning($"Vulkan: pipeline system init failed ({what})\n");
 		return false;
+	}
+
+	// ------------------------------------------------------------------
+	// Descriptor pools (grown on demand as materials introduce new texture sets)
+	// ------------------------------------------------------------------
+
+	readonly List<DescriptorPool> descriptorPools = [];
+
+	bool AddDescriptorPool() {
+		DescriptorPoolSize* poolSizes = stackalloc DescriptorPoolSize[2] {
+			new DescriptorPoolSize(DescriptorType.UniformBufferDynamic, (uint)((int)UniformBlock.Count * framesInFlight)),
+			new DescriptorPoolSize(DescriptorType.CombinedImageSampler, TextureBindingCount * SetsPerPool)
+		};
+		DescriptorPoolCreateInfo poolInfo = new() {
+			SType = StructureType.DescriptorPoolCreateInfo,
+			MaxSets = SetsPerPool + (uint)framesInFlight,
+			PoolSizeCount = 2,
+			PPoolSizes = poolSizes
+		};
+		if (core.Vk.CreateDescriptorPool(core.Device, &poolInfo, null, out DescriptorPool pool) != Result.Success)
+			return false;
+
+		descriptorPools.Add(pool);
+		descriptorPool = pool;
+		return true;
+	}
+
+	/// <summary>Allocates one set of the given layout, adding a pool when the current one is full.</summary>
+	bool AllocateSet(DescriptorSetLayout layout, out DescriptorSet set) {
+		DescriptorSetAllocateInfo allocInfo = new() {
+			SType = StructureType.DescriptorSetAllocateInfo,
+			DescriptorPool = descriptorPool,
+			DescriptorSetCount = 1,
+			PSetLayouts = &layout
+		};
+		Result result = core.Vk.AllocateDescriptorSets(core.Device, &allocInfo, out set);
+		if (result == Result.Success)
+			return true;
+
+		if (result is not (Result.ErrorOutOfPoolMemory or Result.ErrorFragmentedPool))
+			return false;
+
+		if (!AddDescriptorPool())
+			return false;
+
+		allocInfo.DescriptorPool = descriptorPool;
+		return core.Vk.AllocateDescriptorSets(core.Device, &allocInfo, out set) == Result.Success;
 	}
 
 	// ------------------------------------------------------------------
@@ -405,14 +441,7 @@ public unsafe class VulkanPipelineSystem : IDisposable
 		if (vk.CreateSampler(core.Device, &samplerInfo, null, out whiteSampler) != Result.Success)
 			return Fail("white sampler");
 
-		DescriptorSetLayout layout = set1Layout;
-		DescriptorSetAllocateInfo setAlloc = new() {
-			SType = StructureType.DescriptorSetAllocateInfo,
-			DescriptorPool = descriptorPool,
-			DescriptorSetCount = 1,
-			PSetLayouts = &layout
-		};
-		if (vk.AllocateDescriptorSets(core.Device, &setAlloc, out DescriptorSet whiteSet) != Result.Success)
+		if (!AllocateSet(set1Layout, out DescriptorSet whiteSet))
 			return Fail("white descriptor set");
 		Set1WhiteSet = whiteSet;
 
@@ -430,6 +459,121 @@ public unsafe class VulkanPipelineSystem : IDisposable
 		}
 		vk.UpdateDescriptorSets(core.Device, TextureBindingCount, writes, 0, null);
 		return true;
+	}
+
+	// ------------------------------------------------------------------
+	// set 1 (material textures) cache
+	// ------------------------------------------------------------------
+
+	/// <summary>
+	/// The six (view, sampler) pairs a draw samples from. Descriptor sets are immutable once
+	/// written, so one set is cached per distinct combination - materials reuse the same handful.
+	/// </summary>
+	public struct TextureSetKey : IEquatable<TextureSetKey>
+	{
+		public ulong View0, View1, View2, View3, View4, View5;
+		public ulong Sampler0, Sampler1, Sampler2, Sampler3, Sampler4, Sampler5;
+
+		public void Set(int index, ImageView view, VkSampler sampler) {
+			ulong v = view.Handle, s = sampler.Handle;
+			switch (index) {
+				case 0: View0 = v; Sampler0 = s; break;
+				case 1: View1 = v; Sampler1 = s; break;
+				case 2: View2 = v; Sampler2 = s; break;
+				case 3: View3 = v; Sampler3 = s; break;
+				case 4: View4 = v; Sampler4 = s; break;
+				case 5: View5 = v; Sampler5 = s; break;
+			}
+		}
+
+		public readonly (ulong View, ulong Sampler) Get(int index) => index switch {
+			0 => (View0, Sampler0),
+			1 => (View1, Sampler1),
+			2 => (View2, Sampler2),
+			3 => (View3, Sampler3),
+			4 => (View4, Sampler4),
+			_ => (View5, Sampler5)
+		};
+
+		public readonly bool Equals(TextureSetKey other) =>
+			View0 == other.View0 && View1 == other.View1 && View2 == other.View2 &&
+			View3 == other.View3 && View4 == other.View4 && View5 == other.View5 &&
+			Sampler0 == other.Sampler0 && Sampler1 == other.Sampler1 && Sampler2 == other.Sampler2 &&
+			Sampler3 == other.Sampler3 && Sampler4 == other.Sampler4 && Sampler5 == other.Sampler5;
+
+		public override readonly bool Equals(object? obj) => obj is TextureSetKey key && Equals(key);
+
+		public override readonly int GetHashCode() {
+			HashCode hash = new();
+			hash.Add(View0); hash.Add(View1); hash.Add(View2);
+			hash.Add(View3); hash.Add(View4); hash.Add(View5);
+			hash.Add(Sampler0); hash.Add(Sampler3);
+			return hash.ToHashCode();
+		}
+	}
+
+	readonly Dictionary<TextureSetKey, DescriptorSet> textureSets = [];
+	bool warnedTextureSetLimit;
+
+	public DescriptorSet GetTextureSet(in TextureSetKey key) {
+		if (textureSets.TryGetValue(key, out DescriptorSet cached))
+			return cached;
+
+		if (!AllocateSet(set1Layout, out DescriptorSet set)) {
+			if (!warnedTextureSetLimit) {
+				warnedTextureSetLimit = true;
+				Warning("Vulkan: ran out of descriptor sets for material textures; falling back to white\n");
+			}
+			return Set1WhiteSet;
+		}
+
+		DescriptorImageInfo* images = stackalloc DescriptorImageInfo[TextureBindingCount];
+		WriteDescriptorSet* writes = stackalloc WriteDescriptorSet[TextureBindingCount];
+		for (int i = 0; i < TextureBindingCount; i++) {
+			(ulong view, ulong sampler) = key.Get(i);
+			images[i] = new DescriptorImageInfo(
+				new VkSampler(sampler == 0 ? whiteSampler.Handle : sampler),
+				new ImageView(view == 0 ? whiteImageView.Handle : view),
+				ImageLayout.ShaderReadOnlyOptimal);
+			writes[i] = new WriteDescriptorSet {
+				SType = StructureType.WriteDescriptorSet,
+				DstSet = set,
+				DstBinding = (uint)i,
+				DescriptorCount = 1,
+				DescriptorType = DescriptorType.CombinedImageSampler,
+				PImageInfo = &images[i]
+			};
+		}
+		core.Vk.UpdateDescriptorSets(core.Device, TextureBindingCount, writes, 0, null);
+
+		textureSets[key] = set;
+		return set;
+	}
+
+	/// <summary>
+	/// Drops cached sets that reference a view being destroyed - a stale view handle in a
+	/// descriptor set is a use-after-free the moment something draws with it.
+	/// </summary>
+	public void InvalidateTextureSets(ImageView view) {
+		if (view.Handle == 0 || textureSets.Count == 0)
+			return;
+
+		List<TextureSetKey>? doomed = null;
+		foreach (TextureSetKey key in textureSets.Keys) {
+			for (int i = 0; i < TextureBindingCount; i++) {
+				if (key.Get(i).View == view.Handle) {
+					(doomed ??= []).Add(key);
+					break;
+				}
+			}
+		}
+		if (doomed == null)
+			return;
+
+		// The sets themselves are left allocated (their pool is only reset at shutdown); dropping
+		// the cache entry is enough to stop anything binding them again.
+		foreach (TextureSetKey key in doomed)
+			textureSets.Remove(key);
 	}
 
 	// ------------------------------------------------------------------
@@ -661,7 +805,11 @@ public unsafe class VulkanPipelineSystem : IDisposable
 			ring.Dispose();
 		ringBuffers = [];
 
-		if (descriptorPool.Handle != 0) vk.DestroyDescriptorPool(core.Device, descriptorPool, null);
+		textureSets.Clear();
+		foreach (DescriptorPool pool in descriptorPools)
+			vk.DestroyDescriptorPool(core.Device, pool, null);
+		descriptorPools.Clear();
+		descriptorPool = default;
 		if (PipelineLayout.Handle != 0) vk.DestroyPipelineLayout(core.Device, PipelineLayout, null);
 		if (set0Layout.Handle != 0) vk.DestroyDescriptorSetLayout(core.Device, set0Layout, null);
 		if (set1Layout.Handle != 0) vk.DestroyDescriptorSetLayout(core.Device, set1Layout, null);

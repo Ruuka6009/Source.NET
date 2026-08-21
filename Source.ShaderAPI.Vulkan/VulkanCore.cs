@@ -34,6 +34,11 @@ public unsafe class VulkanCore : IDisposable
 	public KhrSwapchain KhrSwapchain { get; private set; } = null!;
 	/// <summary>Whether wireframe/point polygon modes are available (fillModeNonSolid).</summary>
 	public bool SupportsFillModeNonSolid { get; private set; }
+	/// <summary>Whether anisotropic sampling is available, and the device's ceiling for it.</summary>
+	public bool SupportsAnisotropy { get; private set; }
+	public float MaxAnisotropy { get; private set; } = 1.0f;
+	/// <summary>Whether BC1-BC7 (DXT/RGTC) compressed textures can be sampled.</summary>
+	public bool SupportsTextureCompressionBC { get; private set; }
 
 	ExtDebugUtils? debugUtils;
 	DebugUtilsMessengerEXT debugMessenger;
@@ -279,6 +284,13 @@ public unsafe class VulkanCore : IDisposable
 	bool CreateLogicalDevice() {
 		Vk.GetPhysicalDeviceFeatures(PhysicalDevice, out PhysicalDeviceFeatures supported);
 		SupportsFillModeNonSolid = supported.FillModeNonSolid;
+		SupportsAnisotropy = supported.SamplerAnisotropy;
+		SupportsTextureCompressionBC = supported.TextureCompressionBC;
+		if (!SupportsTextureCompressionBC)
+			Warning("Vulkan: device reports no BC texture compression; DXT/ATI textures will fail to create\n");
+
+		Vk.GetPhysicalDeviceProperties(PhysicalDevice, out PhysicalDeviceProperties deviceProps);
+		MaxAnisotropy = SupportsAnisotropy ? deviceProps.Limits.MaxSamplerAnisotropy : 1.0f;
 
 		float priority = 1.0f;
 		uint[] uniqueFamilies = GraphicsQueueFamily == PresentQueueFamily
@@ -304,7 +316,11 @@ public unsafe class VulkanCore : IDisposable
 		PhysicalDeviceFeatures2 features2 = new() {
 			SType = StructureType.PhysicalDeviceFeatures2,
 			PNext = &features13,
-			Features = new PhysicalDeviceFeatures { FillModeNonSolid = SupportsFillModeNonSolid }
+			Features = new PhysicalDeviceFeatures {
+				FillModeNonSolid = SupportsFillModeNonSolid,
+				SamplerAnisotropy = SupportsAnisotropy,
+				TextureCompressionBC = SupportsTextureCompressionBC
+			}
 		};
 
 		byte** extensionsPtr = (byte**)SilkMarshal.StringArrayToPtr(new[] { KhrSwapchain.ExtensionName });

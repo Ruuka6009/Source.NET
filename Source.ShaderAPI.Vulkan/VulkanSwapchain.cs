@@ -111,8 +111,15 @@ public unsafe class VulkanSwapchain : IDisposable
 		fixed (SurfaceFormatKHR* formatsPtr = formats)
 			core.KhrSurface.GetPhysicalDeviceSurfaceFormats(core.PhysicalDevice, core.Surface, &count, formatsPtr);
 
+		// UNORM, not SRGB: the GL backend never enables GL_FRAMEBUFFER_SRGB, so its shaders write
+		// values straight to the backbuffer. An _Srgb swapchain would apply a linear->sRGB encode
+		// on top of that and wash every colour out relative to -gl.
 		foreach (SurfaceFormatKHR format in formats) {
-			if (format.Format == Format.B8G8R8A8Srgb && format.ColorSpace == ColorSpaceKHR.SpaceSrgbNonlinearKhr)
+			if (format.Format == Format.B8G8R8A8Unorm && format.ColorSpace == ColorSpaceKHR.SpaceSrgbNonlinearKhr)
+				return format;
+		}
+		foreach (SurfaceFormatKHR format in formats) {
+			if (format.Format == Format.R8G8B8A8Unorm && format.ColorSpace == ColorSpaceKHR.SpaceSrgbNonlinearKhr)
 				return format;
 		}
 		return formats[0];

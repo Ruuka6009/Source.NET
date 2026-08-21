@@ -2,6 +2,7 @@ using Microsoft.Extensions.DependencyInjection;
 
 using Silk.NET.Vulkan;
 
+using Source.Bitmap;
 using Source.Common;
 using Source.Common.Bitmap;
 using Source.Common.Launcher;
@@ -44,6 +45,7 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	VulkanGraphicsContext? Device;
 	VulkanMemoryAllocator? allocator;
 	VulkanPipelineSystem? pipelines;
+	VulkanTextureManager? textureManager;
 	MeshMgrVulkan MeshMgr = null!;
 
 	internal GraphicsDriver Driver = GraphicsDriver.Vulkan13;
@@ -103,6 +105,10 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		if (!pipelines.Init())
 			return false;
 
+		textureManager = new VulkanTextureManager(core, allocator);
+		if (!textureManager.Init())
+			return false;
+
 		Device = new VulkanGraphicsContext(core, swapchain);
 		Driver = deviceInfo.Driver;
 		return true;
@@ -115,7 +121,7 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 
 		InitRenderState();
 
-		Msg("Vulkan: device is up (pipelines + meshes + uniform ring; textures are still the white placeholder)\n");
+		Msg("Vulkan: device is up (pipelines, meshes, uniform ring, textures)\n");
 		return true;
 	}
 
@@ -147,6 +153,11 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	public void ReacquireResources() { }
 
 	void DestroyDevice() {
+		foreach (VulkanTexture texture in textures.Values)
+			textureManager?.Destroy(texture);
+		textures.Clear();
+		textureManager?.Dispose();
+		textureManager = null;
 		pipelines?.Dispose();
 		pipelines = null;
 		foreach ((VulkanBufferResource buffer, _) in retiredBuffers)
@@ -241,6 +252,11 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 			return true;
 		if (frameLoop.NeedsRecreate)
 			return false; // handled at Present
+
+		// Pixels queued by texture loads must reach the GPU before anything samples them, and
+		// copies cannot be recorded inside the frame's dynamic rendering pass.
+		textureManager?.Flush();
+
 		if (!frameLoop.BeginFrame(clearR, clearG, clearB))
 			return false;
 		OnFrameBegun();
@@ -249,12 +265,14 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 
 	void OnFrameBegun() {
 		TickRetiredBuffers();
+		textureManager!.TickRetiredViews();
 		pipelines!.BeginFrame(frameLoop!.FrameIndex);
 
 		for (int i = 0; i < (int)VulkanPipelineSystem.UniformBlock.Count; i++)
 			uniformDirty[i] = true;
 		descriptorsBound = false;
 		boundPipeline = default;
+		boundTextureSet = default;
 		pushFlagsDirty = true;
 	}
 
@@ -330,6 +348,11 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	internal void SetCurrentShadow(ShadowStateVulkan shadow) {
 		currentShadow = shadow;
 		currentBoardState = shadow.State;
+
+		// Each snapshot re-declares which sampler unit feeds which binding as it binds its
+		// textures; start from nothing so a previous material's routing cannot leak in.
+		Array.Fill(samplerForBinding, -1);
+		lastTextureSetValid = false;
 	}
 
 	public void InitRenderState() {
@@ -500,21 +523,54 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	int pushFlags;
 	bool pushFlagsDirty = true;
 	const int UniformFlags = 0;
+	const int UniformTextureBase = 0x1000;
+
+	/// <summary>
+	/// set-1 binding for each texture name, matching the layout(binding=) declarations in the
+	/// *_vk13 fragment shaders (documented in common_vk13.glsl).
+	/// </summary>
+	static int TextureBindingFor(ReadOnlySpan<char> name) {
+		if (name.SequenceEqual("basetexture")) return 0;
+		if (name.SequenceEqual("envmap")) return 1;
+		if (name.SequenceEqual("envmapmask")) return 2;
+		if (name.SequenceEqual("lightmaptexture")) return 3;
+		if (name.SequenceEqual("bumpmap")) return 4;
+		if (name.SequenceEqual("basetexture2")) return 5;
+		return -1;
+	}
+
+	/// <summary>Which sampler unit currently feeds each set-1 binding; -1 when the shader did not say.</summary>
+	readonly int[] samplerForBinding = new int[VulkanPipelineSystem.TextureBindingCount];
 
 	public int LocateShaderUniform(ReadOnlySpan<char> name) {
 		if (name.Length > 0 && name[0] == '$')
 			name = name[1..];
-		// The only loose uniform the vk13 shaders have is the push-constant flags; GL's sampler
-		// unit assignments (e.g. "lightmaptexture" -> 1) are fixed set-1 bindings here.
-		return name.SequenceEqual("flags") ? UniformFlags : -1;
+
+		if (name.SequenceEqual("flags"))
+			return UniformFlags;
+
+		// GL answers "which texture unit is this sampler on"; the vk13 shaders have fixed
+		// bindings instead, so the same call is used in reverse - the shader tells us which unit
+		// it put a given texture on, and we route that unit to the binding the shader samples.
+		int binding = TextureBindingFor(name);
+		return binding >= 0 ? UniformTextureBase + binding : -1;
 	}
 
 	public void SetShaderUniform(int uniform, int integer) {
-		if (uniform != UniformFlags)
+		if (uniform == UniformFlags) {
+			if (pushFlags != integer) {
+				pushFlags = integer;
+				pushFlagsDirty = true;
+			}
 			return;
-		if (pushFlags != integer) {
-			pushFlags = integer;
-			pushFlagsDirty = true;
+		}
+
+		if (uniform >= UniformTextureBase) {
+			int binding = uniform - UniformTextureBase;
+			if (binding < samplerForBinding.Length && samplerForBinding[binding] != integer) {
+				samplerForBinding[binding] = integer;
+				lastTextureSetValid = false;
+			}
 		}
 	}
 
@@ -611,6 +667,11 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 			return false;
 		}
 
+		// A texture uploaded after this frame opened (procedural/dynamic content) still has its
+		// copy sitting unsubmitted; get it onto the GPU before a draw samples it.
+		if (textureManager!.HasPendingWork)
+			textureManager.Flush();
+
 		Vk vk = core!.Vk;
 		CommandBuffer cmd = frameLoop!.Cmd;
 
@@ -645,11 +706,13 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 			offsetsChanged = true;
 		}
 
-		if (offsetsChanged || !descriptorsBound) {
-			DescriptorSet* sets = stackalloc DescriptorSet[2] { pipelines.CurrentSet0, pipelines.Set1WhiteSet };
+		DescriptorSet textureSet = ResolveTextureSet();
+		if (offsetsChanged || !descriptorsBound || textureSet.Handle != boundTextureSet.Handle) {
+			DescriptorSet* sets = stackalloc DescriptorSet[2] { pipelines.CurrentSet0, textureSet };
 			fixed (uint* offsets = uniformOffsets)
 				vk.CmdBindDescriptorSets(cmd, PipelineBindPoint.Graphics, pipelines.PipelineLayout, 0, 2, sets, (uint)BlockCount, offsets);
 			descriptorsBound = true;
+			boundTextureSet = textureSet;
 		}
 
 		// Push constants
@@ -661,6 +724,44 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 
 		ApplyViewportAndScissor(vk, cmd);
 		return true;
+	}
+
+	VulkanPipelineSystem.TextureSetKey lastTextureSetKey;
+	DescriptorSet lastTextureSet;
+	DescriptorSet boundTextureSet;
+	bool lastTextureSetValid;
+
+	/// <summary>
+	/// Builds set 1 from the textures the shader routed to each binding: the shader told us which
+	/// sampler unit it put each named texture on (see <see cref="SetShaderUniform(int, int)"/>),
+	/// and <see cref="BindTexture"/> recorded what is on each unit. Bindings the material never
+	/// routed fall back to the 1x1 white texture.
+	/// </summary>
+	DescriptorSet ResolveTextureSet() {
+		if (lastTextureSetValid)
+			return lastTextureSet;
+
+		VulkanPipelineSystem.TextureSetKey key = default;
+		for (int binding = 0; binding < samplerForBinding.Length; binding++) {
+			int sampler = samplerForBinding[binding];
+			if (sampler < 0 || sampler >= boundTextures.Length)
+				continue;
+
+			ShaderAPITextureHandle_t handle = boundTextures[sampler];
+			if (!textures.TryGetValue(handle, out VulkanTexture? texture) || !texture.HasContent)
+				continue;
+
+			ImageView view = textureManager!.GetView(texture);
+			if (view.Handle == 0)
+				continue;
+
+			key.Set(binding, view, textureManager.GetSampler(in texture.Sampler));
+		}
+
+		lastTextureSetKey = key;
+		lastTextureSet = pipelines!.GetTextureSet(in key);
+		lastTextureSetValid = true;
+		return lastTextureSet;
 	}
 
 	void UpdateSharedBlocksFromShadow() {
@@ -755,16 +856,24 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	public int GetMaxIndicesToRender() => MeshMgr.GetMaxIndicesToRender();
 
 	// ------------------------------------------------------------------
-	// Textures (still placeholder - Phase 4 continues next session)
+	// Textures
 	// ------------------------------------------------------------------
 
+	readonly Dictionary<ShaderAPITextureHandle_t, VulkanTexture> textures = [];
 	ShaderAPITextureHandle_t nextTextureHandle = 1;
-	readonly HashSet<ShaderAPITextureHandle_t> textureHandles = [];
+	ShaderAPITextureHandle_t modifyTextureHandle = INVALID_SHADERAPI_TEXTURE_HANDLE;
+
+	VulkanTexture? ModifyTarget =>
+		textures.TryGetValue(modifyTextureHandle, out VulkanTexture? texture) ? texture : null;
 
 	public ShaderAPITextureHandle_t CreateTexture(int width, int height, int depth, ImageFormat imageFormat, ushort mipCount, int copies,
 		CreateTextureFlags creationFlags, ReadOnlySpan<char> debugName, ReadOnlySpan<char> textureGroup) {
 		ShaderAPITextureHandle_t handle = nextTextureHandle++;
-		textureHandles.Add(handle);
+
+		VulkanTexture? texture = textureManager?.Create(width, height, depth, imageFormat, mipCount, copies, creationFlags, debugName);
+		if (texture != null)
+			textures[handle] = texture;
+
 		return handle;
 	}
 
@@ -777,23 +886,245 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	public ShaderAPITextureHandle_t CreateDepthTexture(ImageFormat imageFormat, ushort width, ushort height, Span<char> debugName, bool texture)
 		=> CreateTexture(width, height, 1, imageFormat, 1, 1, CreateTextureFlags.DepthBuffer, debugName, default);
 
-	public bool IsTexture(ShaderAPITextureHandle_t handle) => textureHandles.Contains(handle);
-	public void DeleteTexture(ShaderAPITextureHandle_t handle) => textureHandles.Remove(handle);
+	public bool IsTexture(ShaderAPITextureHandle_t handle) => textures.ContainsKey(handle);
+
+	public void DeleteTexture(ShaderAPITextureHandle_t handle) {
+		if (!textures.Remove(handle, out VulkanTexture? texture))
+			return;
+
+		// Anything still pointing at this texture's views must stop doing so before they die.
+		foreach (ImageView view in texture.Views)
+			pipelines?.InvalidateTextureSets(view);
+		lastTextureSetValid = false;
+
+		for (int i = 0; i < boundTextures.Length; i++)
+			if (boundTextures[i] == handle)
+				boundTextures[i] = INVALID_SHADERAPI_TEXTURE_HANDLE;
+
+		core?.Vk.DeviceWaitIdle(core.Device);
+		textureManager?.Destroy(texture);
+	}
+
 	public ImageFormat GetNearestSupportedFormat(ImageFormat fmt, bool filteringRequired = true) => fmt;
 	public bool CanDownloadTextures() => IsActive();
 
-	public void ModifyTexture(int handle) { }
-	public void TexImage2D(int mip, int face, ImageFormat dstFormat, int zOffset, int width, int height, ImageFormat srcFormat, bool srcIsTiled, Span<byte> imageData) { }
-	public void TexSubImage2D(int mip, int face, int x, int y, int z, int width, int height, ImageFormat srcFormat, int srcStride, Span<byte> imageData) { }
-	public void TexImageFromVTF(IVTFTexture? vtfTexture, int i) { }
-	public void TexWrap(TexCoordComponent coord, TexWrapMode wrapMode) { }
-	public void TexMinFilter(TexFilterMode mode) { }
-	public void TexMagFilter(TexFilterMode mode) { }
-	public bool TexLock(int level, int cubeFaceID, int xOffset, int yOffset, int width, int height, ref PixelWriter writer) => false;
-	public bool TexLock(int level, int cubeFaceID, int xOffset, int yOffset, int width, int height, ref PixelWriterMem writer) => false;
-	public void TexUnlock() { }
-	public void BindTexture(Sampler sampler, ShaderAPITextureHandle_t textureHandle) { }
-	public void BindStandardTexture(Sampler sampler, StandardTextureId id) { }
+	public void ModifyTexture(int handle) {
+		modifyTextureHandle = handle;
+
+		// GL advances to the next copy when a texture that is still in flight is rewritten.
+		if (textures.TryGetValue(handle, out VulkanTexture? texture) && texture.SwitchNeeded) {
+			if (texture.Images.Length > 1) {
+				texture.CurrentCopy = (texture.CurrentCopy + 1) % texture.Images.Length;
+				lastTextureSetValid = false;
+			}
+			texture.SwitchNeeded = false;
+		}
+	}
+
+	public void TexImage2D(int mip, int face, ImageFormat dstFormat, int zOffset, int width, int height, ImageFormat srcFormat, bool srcIsTiled, Span<byte> imageData) {
+		VulkanTexture? texture = ModifyTarget;
+		if (texture == null)
+			return;
+
+		// GL's BlitSurfaceBits uploads (width >> mip) x (height >> mip): the caller passes the
+		// level-0 size and lets the mip shift do the work.
+		textureManager?.Upload(texture, mip, face, srcFormat, Math.Max(width >> mip, 1), Math.Max(height >> mip, 1), imageData);
+		texture.SwitchNeeded = true;
+	}
+
+	public void TexSubImage2D(int mip, int face, int x, int y, int z, int width, int height, ImageFormat srcFormat, int srcStride, Span<byte> imageData) {
+		VulkanTexture? texture = ModifyTarget;
+		if (texture == null)
+			return;
+
+		int mipWidth = Math.Max(width >> mip, 1);
+		int mipHeight = Math.Max(height >> mip, 1);
+
+		if (x == 0 && y == 0 && mipWidth == Math.Max(texture.Width >> mip, 1) && mipHeight == Math.Max(texture.Height >> mip, 1))
+			textureManager?.Upload(texture, mip, face, srcFormat, mipWidth, mipHeight, imageData, srcStride);
+		else
+			textureManager?.UploadSubRect(texture, mip, face, x, y, mipWidth, mipHeight, srcFormat, imageData, srcStride);
+
+		texture.SwitchNeeded = true;
+	}
+
+	public void TexImageFromVTF(IVTFTexture? vtf, int vtfFrame) {
+		VulkanTexture? texture = ModifyTarget;
+		if (vtf == null || texture == null)
+			return;
+
+		if (vtf.Depth() > 1) {
+			Warning($"Vulkan: volume textures are not supported ('{texture.DebugName}')\n");
+			return;
+		}
+
+		ImageFormat srcFormat = vtf.Format();
+		int mipCount = Math.Min(vtf.MipCount(), texture.MipCount);
+
+		if (vtf.IsCubeMap() && texture.IsCubeMap) {
+			int faces = Math.Min(vtf.FaceCount(), 6);
+			if (faces < 6) {
+				Warning($"Vulkan: cubemap '{texture.DebugName}' has only {faces} faces\n");
+				return;
+			}
+			for (int mip = 0; mip < mipCount; mip++) {
+				vtf.ComputeMipLevelDimensions(mip, out int w, out int h, out _);
+				for (int face = 0; face < 6; face++)
+					textureManager?.Upload(texture, mip, face, srcFormat, w, h, vtf.ImageData(vtfFrame, face, mip));
+			}
+		}
+		else {
+			for (int mip = 0; mip < mipCount; mip++) {
+				vtf.ComputeMipLevelDimensions(mip, out int w, out int h, out _);
+				textureManager?.Upload(texture, mip, 0, srcFormat, w, h, vtf.ImageData(vtfFrame, 0, mip));
+			}
+		}
+
+		texture.SwitchNeeded = true;
+	}
+
+	public void TexWrap(TexCoordComponent coord, TexWrapMode wrapMode) {
+		VulkanTexture? texture = ModifyTarget;
+		if (texture == null)
+			return;
+
+		SamplerAddressMode mode = wrapMode switch {
+			TexWrapMode.Clamp => SamplerAddressMode.ClampToEdge,
+			TexWrapMode.Repeat => SamplerAddressMode.Repeat,
+			TexWrapMode.Border => SamplerAddressMode.ClampToBorder,
+			_ => SamplerAddressMode.Repeat
+		};
+
+		switch (coord) {
+			case TexCoordComponent.S: texture.Sampler.AddressU = mode; break;
+			case TexCoordComponent.T: texture.Sampler.AddressV = mode; break;
+			case TexCoordComponent.U: texture.Sampler.AddressW = mode; break;
+			default: Warning("Vulkan: TexWrap with an unknown coordinate\n"); return;
+		}
+		lastTextureSetValid = false;
+	}
+
+	public void TexMinFilter(TexFilterMode mode) {
+		VulkanTexture? texture = ModifyTarget;
+		if (texture == null)
+			return;
+
+		ref SamplerDesc sampler = ref texture.Sampler;
+		sampler.Anisotropic = false;
+		switch (mode) {
+			case TexFilterMode.Nearest: sampler.MinFilter = Filter.Nearest; sampler.MipmapMode = SamplerMipmapMode.Nearest; break;
+			case TexFilterMode.Linear: sampler.MinFilter = Filter.Linear; sampler.MipmapMode = SamplerMipmapMode.Nearest; break;
+			case TexFilterMode.NearestMipmapNearest: sampler.MinFilter = Filter.Nearest; sampler.MipmapMode = SamplerMipmapMode.Nearest; break;
+			case TexFilterMode.LinearMipmapNearest: sampler.MinFilter = Filter.Linear; sampler.MipmapMode = SamplerMipmapMode.Nearest; break;
+			case TexFilterMode.NearestMipmapLinear: sampler.MinFilter = Filter.Nearest; sampler.MipmapMode = SamplerMipmapMode.Linear; break;
+			case TexFilterMode.LinearMipmapLinear: sampler.MinFilter = Filter.Linear; sampler.MipmapMode = SamplerMipmapMode.Linear; break;
+			case TexFilterMode.Anisotropic:
+				sampler.MinFilter = Filter.Linear;
+				sampler.MipmapMode = SamplerMipmapMode.Linear;
+				sampler.Anisotropic = true;
+				break;
+		}
+		lastTextureSetValid = false;
+	}
+
+	public void TexMagFilter(TexFilterMode mode) {
+		VulkanTexture? texture = ModifyTarget;
+		if (texture == null)
+			return;
+
+		texture.Sampler.MagFilter = mode == TexFilterMode.Nearest ? Filter.Nearest : Filter.Linear;
+		lastTextureSetValid = false;
+	}
+
+	// TexLock hands the caller a CPU buffer to paint into; TexUnlock uploads it. Unlike GL this
+	// does not read the existing contents back (no host-visible copy exists), so callers that
+	// only touch part of the rect will write zeroes over the rest - the same rects the engine
+	// locks are fully rewritten in practice.
+	byte[] lockBuffer = new byte[2048 * 2048 * 4];
+	bool lockActive;
+	int lockMip, lockFace, lockX, lockY, lockWidth, lockHeight;
+	ImageFormat lockFormat;
+	ShaderAPITextureHandle_t lockHandle;
+
+	bool BeginTexLock(int level, int cubeFaceID, int xOffset, int yOffset, int width, int height, out Memory<byte> buffer) {
+		buffer = default;
+		VulkanTexture? texture = ModifyTarget;
+		if (texture == null || lockActive || width <= 0 || height <= 0)
+			return false;
+
+		ImageFormat format = texture.StorageFormat;
+		if (format.IsCompressed()) {
+			Warning($"Vulkan: TexLock on compressed texture '{texture.DebugName}' is not supported\n");
+			return false;
+		}
+
+		int size = ImageLoader.SizeInBytes(format) * width * height;
+		if (size > lockBuffer.Length)
+			lockBuffer = new byte[MathLib.CeilPow2(size)];
+		Array.Clear(lockBuffer, 0, size);
+
+		lockActive = true;
+		lockMip = level;
+		lockFace = cubeFaceID;
+		lockX = xOffset;
+		lockY = yOffset;
+		lockWidth = width;
+		lockHeight = height;
+		lockFormat = format;
+		lockHandle = modifyTextureHandle;
+
+		buffer = lockBuffer.AsMemory(0, size);
+		return true;
+	}
+
+	public bool TexLock(int level, int cubeFaceID, int xOffset, int yOffset, int width, int height, ref PixelWriter writer) {
+		if (!BeginTexLock(level, cubeFaceID, xOffset, yOffset, width, height, out Memory<byte> buffer))
+			return false;
+		writer.SetPixelMemory(lockFormat, buffer.Span, width * ImageLoader.SizeInBytes(lockFormat));
+		return true;
+	}
+
+	public bool TexLock(int level, int cubeFaceID, int xOffset, int yOffset, int width, int height, ref PixelWriterMem writer) {
+		if (!BeginTexLock(level, cubeFaceID, xOffset, yOffset, width, height, out Memory<byte> buffer))
+			return false;
+		writer.SetPixelMemory(lockFormat, buffer, width * ImageLoader.SizeInBytes(lockFormat));
+		return true;
+	}
+
+	public void TexUnlock() {
+		if (!lockActive)
+			return;
+		lockActive = false;
+
+		if (textures.TryGetValue(lockHandle, out VulkanTexture? texture)) {
+			int size = ImageLoader.SizeInBytes(lockFormat) * lockWidth * lockHeight;
+			textureManager?.UploadSubRect(texture, lockMip, lockFace, lockX, lockY, lockWidth, lockHeight,
+				lockFormat, lockBuffer.AsSpan(0, size));
+			texture.SwitchNeeded = true;
+		}
+	}
+
+	// --- binding ---
+
+	readonly ShaderAPITextureHandle_t[] boundTextures = CreateBoundTextureTable();
+
+	static ShaderAPITextureHandle_t[] CreateBoundTextureTable() {
+		ShaderAPITextureHandle_t[] table = new ShaderAPITextureHandle_t[(int)Sampler.MaxSamplers];
+		Array.Fill(table, INVALID_SHADERAPI_TEXTURE_HANDLE);
+		return table;
+	}
+
+	public void BindTexture(Sampler sampler, ShaderAPITextureHandle_t textureHandle) {
+		if (textureHandle == INVALID_SHADERAPI_TEXTURE_HANDLE || (int)sampler >= boundTextures.Length)
+			return;
+
+		if (boundTextures[(int)sampler] != textureHandle) {
+			boundTextures[(int)sampler] = textureHandle;
+			lastTextureSetValid = false;
+		}
+	}
+
+	public void BindStandardTexture(Sampler sampler, StandardTextureId id) => ShaderUtil.BindStandardTexture(sampler, id);
 	public void SetStandardTextureHandle(StandardTextureId id, int handle) { }
 
 	// ------------------------------------------------------------------

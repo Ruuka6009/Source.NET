@@ -1,4 +1,4 @@
-using Microsoft.Extensions.DependencyInjection;
+﻿using Microsoft.Extensions.DependencyInjection;
 
 using Silk.NET.Vulkan;
 
@@ -9,6 +9,7 @@ using Source.Common.Launcher;
 using Source.Common.MaterialSystem;
 using Source.Common.Mathematics;
 using Source.Common.ShaderAPI;
+using Source.Common.ShaderLib;
 
 using System.Numerics;
 using System.Runtime.InteropServices;
@@ -452,6 +453,13 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		Matrix4x4 transposed = Matrix4x4.Transpose(matrix);
 		Block<Matrix4x4>(VulkanPipelineSystem.UniformBlock.Bones)[boneIndex] = transposed;
 		MarkDirty(VulkanPipelineSystem.UniformBlock.Bones);
+
+		// GL parity: bone 0 doubles as the model matrix, which is what the unskinned path in the
+		// vertex shaders transforms by. Without this, models draw at the wrong place.
+		if (boneIndex == 0) {
+			MatrixMode(MaterialMatrixMode.Model);
+			LoadMatrix(matrix);
+		}
 	}
 
 	public void SetSkinningMatrices() {
@@ -573,8 +581,54 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 
 	internal VulkanShaderCombos Combos => ((ShaderSystemVulkan)ShaderManager).Combos;
 	public nint GetCurrentProgram() => 0;
-	public void SetVertexShaderStateAmbientLightCube() { }
-	public void CommitVertexShaderLighting() { }
+	public void SetVertexShaderStateAmbientLightCube() {
+		SetVertexShaderConstant(VertexShaderConst.AmbientLight, MemoryMarshal.Cast<Vector4, float>(ambientLightCube.AsSpan()));
+	}
+
+	/// <summary>
+	/// Packs the enabled lights into vs_const at VertexShaderConst.Lights, five vec4s each, in the
+	/// layout common_vs_vk13.glsl reads back (colour+directional flag, direction+spot flag,
+	/// position, spot params, attenuation).
+	/// </summary>
+	public void CommitVertexShaderLighting() {
+		if (!lightingDirty)
+			return;
+		lightingDirty = false;
+
+		SetVertexShaderStateAmbientLightCube();
+
+		Span<Vector4> lightState = stackalloc Vector4[5];
+		int slot = 0;
+		for (int i = 0; i < MaxNumLights; i++) {
+			if (!lightEnabled[i])
+				continue;
+
+			ref LightDesc light = ref lightDescs[i];
+
+			float w = light.Type == LightType.Directional ? 1.0f : 0.0f;
+			lightState[0] = new Vector4(light.Color, w);
+
+			w = light.Type == LightType.Spot ? 1.0f : 0.0f;
+			lightState[1] = new Vector4(light.Direction, w);
+
+			lightState[2] = new Vector4(light.Position, 1.0f);
+
+			if (light.Type == LightType.Spot) {
+				float stopDot = MathF.Cos(light.Theta * 0.5f);
+				float stopDot2 = MathF.Cos(light.Phi * 0.5f);
+				float ooDot = stopDot > stopDot2 ? 1.0f / (stopDot - stopDot2) : 0.0f;
+				lightState[3] = new Vector4(light.Falloff, stopDot, stopDot2, ooDot);
+			}
+			else {
+				lightState[3] = new Vector4(0, 1, 1, 1);
+			}
+
+			lightState[4] = new Vector4(light.Attenuation0, light.Attenuation1, light.Attenuation2, 0.0f);
+
+			SetVertexShaderConstant(VertexShaderConst.Lights + slot * 5, MemoryMarshal.Cast<Vector4, float>(lightState));
+			slot++;
+		}
+	}
 	public void InvalidateDelayedShaderConstants() { }
 
 	MeshVulkan? RenderMesh;
@@ -1267,13 +1321,76 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	public void SetStencilTestMask(uint msk) { }
 	public void SetStencilWriteMask(uint msk) { }
 
-	public void SetAmbientLightCube(ReadOnlySpan<Vector4> cube) { }
-	public void SetLightingOrigin(Vector3 lightingOrigin) { }
+	public const int MaxNumLights = 4;
+
+	readonly Vector4[] ambientLightCube = new Vector4[6];
+	readonly LightDesc[] lightDescs = new LightDesc[MaxNumLights];
+	readonly bool[] lightEnabled = new bool[MaxNumLights];
+	int numLights;
+	bool lightingDirty = true;
+
+	public void SetAmbientLightCube(ReadOnlySpan<Vector4> cube) {
+		if (cube.Length < 6 || cube.SequenceEqual(ambientLightCube))
+			return;
+		cube[..6].CopyTo(ambientLightCube);
+		lightingDirty = true;
+	}
+
+	Vector3 lightingOrigin;
+	public void SetLightingOrigin(Vector3 origin) {
+		if (origin != lightingOrigin) {
+			FlushBufferedPrimitives();
+			lightingOrigin = origin;
+		}
+	}
+
 	public void SetAmbientLight(float r, float g, float b) { }
-	public void SetLight(int lightNum, in LightDesc desc) { }
-	public void DisableAllLocalLights() { }
-	public int GetMaxLights() => 4;
-	public void GetLightState(out LightState state) => state = default;
+
+	public void SetLight(int lightNum, in LightDesc desc) {
+		if (lightNum < 0 || lightNum >= MaxNumLights)
+			return;
+
+		FlushBufferedPrimitives();
+		lightDescs[lightNum] = desc;
+		lightEnabled[lightNum] = desc.Type != LightType.Disable;
+		RecountLights();
+		lightingDirty = true;
+	}
+
+	public void DisableAllLocalLights() {
+		for (int i = 0; i < MaxNumLights; i++) {
+			if (!lightEnabled[i])
+				continue;
+			FlushBufferedPrimitives();
+			lightDescs[i].Type = LightType.Disable;
+			lightEnabled[i] = false;
+		}
+		RecountLights();
+		lightingDirty = true;
+	}
+
+	void RecountLights() {
+		numLights = 0;
+		for (int i = 0; i < MaxNumLights; i++)
+			if (lightEnabled[i])
+				numLights++;
+	}
+
+	public int GetMaxLights() => MaxNumLights;
+
+	public void GetLightState(out LightState state) {
+		state = default;
+
+		foreach (Vector4 entry in ambientLightCube) {
+			if (entry.X != 0 || entry.Y != 0 || entry.Z != 0) {
+				state.AmbientLight = true;
+				break;
+			}
+		}
+
+		state.NumLights = numLights;
+		state.StaticLightVertex = RenderMesh?.HasColorMesh() ?? false;
+	}
 	public void SetFlashlightStateEx(in FlashlightState state, in Matrix4x4 worldToTexture, ITexture? flashlightDepthTexture) { }
 	public bool InFlashlightMode() => false;
 	public MaterialFogMode GetSceneFogMode() => MaterialFogMode.None;

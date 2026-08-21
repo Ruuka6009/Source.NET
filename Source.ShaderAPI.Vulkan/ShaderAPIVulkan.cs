@@ -615,10 +615,8 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	/// position, spot params, attenuation).
 	/// </summary>
 	public void CommitVertexShaderLighting() {
-		if (!lightingDirty)
-			return;
-		lightingDirty = false;
-
+		// Called per draw; SetVertexShaderConstant already skips writes whose values are unchanged,
+		// so this does not need its own dirty flag.
 		SetVertexShaderStateAmbientLightCube();
 
 		Span<Vector4> lightState = stackalloc Vector4[5];
@@ -664,6 +662,9 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	public void DrawMesh(IMesh imesh) {
 		MeshVulkan mesh = (MeshVulkan)imesh;
 		RenderMesh = mesh;
+		// GL parity (CommitStateChanges): the lighting constants have to reach vs_const before the
+		// draw, or every lit model shades to black.
+		CommitVertexShaderLighting();
 		Material!.DrawMesh(VertexCompressionType.None);
 		RenderMesh = null;
 	}
@@ -1428,13 +1429,11 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 	readonly LightDesc[] lightDescs = new LightDesc[MaxNumLights];
 	readonly bool[] lightEnabled = new bool[MaxNumLights];
 	int numLights;
-	bool lightingDirty = true;
 
 	public void SetAmbientLightCube(ReadOnlySpan<Vector4> cube) {
 		if (cube.Length < 6 || cube.SequenceEqual(ambientLightCube))
 			return;
 		cube[..6].CopyTo(ambientLightCube);
-		lightingDirty = true;
 	}
 
 	Vector3 lightingOrigin;
@@ -1455,7 +1454,6 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 		lightDescs[lightNum] = desc;
 		lightEnabled[lightNum] = desc.Type != LightType.Disable;
 		RecountLights();
-		lightingDirty = true;
 	}
 
 	public void DisableAllLocalLights() {
@@ -1467,7 +1465,6 @@ public class ShaderAPIVulkan : IShaderAPI, IShaderDevice, IDebugTextureInfo
 			lightEnabled[i] = false;
 		}
 		RecountLights();
-		lightingDirty = true;
 	}
 
 	void RecountLights() {

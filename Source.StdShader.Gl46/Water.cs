@@ -112,7 +112,11 @@ public class Water : BaseVSShader
 			// ps_const[0] = fog colour + reflect amount, ps_const[1].x = ripple strength
 			Span<float> fog = stackalloc float[4];
 			vars[FOGCOLOR].GetVecValue(fog[..3]);
-			fog[3] = vars[REFLECTAMOUNT].GetFloatValue();
+
+			// With no cubemap bound the backends substitute a 1x1 white texture, and blending
+			// toward that turns the whole surface white. Reflect nothing instead, so the water
+			// shows its own colour.
+			fog[3] = vars[ENVMAP].IsTexture() ? vars[REFLECTAMOUNT].GetFloatValue() : 0.0f;
 			shaderAPI.SetPixelShaderConstant(0, fog);
 
 			// Ripple strength stays 0 while no normal map is loaded (see OnInitShaderInstance).
